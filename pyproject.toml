@@ -7,7 +7,11 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.12"
+fastapi = "^0.115.8"
+click = {version = "^8.1.8", optional = true}
 
+[tool.poetry.extras]
+cli=["click"]
 
 [tool.poetry.group.dev]
 optional = true
@@ -19,6 +23,7 @@ python-dotenv = "^1.0.1"
 pydantic-settings = "^2.7.1"
 testcontainers = "^4.9.0"
 mypy = "^1.13.0"
+uvicorn = "^0.34.0"
 
 
 [tool.pyright]

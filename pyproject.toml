@@ -24,7 +24,30 @@ pydantic-settings = "^2.7.1"
 testcontainers = "^4.9.0"
 mypy = "^1.13.0"
 uvicorn = "^0.34.0"
+pytest-cov = "^6.0.0"
 
+[tool.pytest.ini_options]
+# Basic pytest configuration
+testpaths = ["tests"]
+python_files = "*_test.py"
+# For pytest-asyncio
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["ilpas"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:"
+]
+
+# Optional HTML report settings
+[tool.coverage.html]
+directory = "coverage_html_report"
 
 [tool.pyright]
 strict = true

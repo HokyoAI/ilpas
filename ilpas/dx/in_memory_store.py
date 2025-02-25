@@ -1,16 +1,8 @@
-from typing import Dict, Iterable, List, Literal, Optional, Set
+from typing import Dict, Iterable, Set
 from uuid import uuid4
 
-from ..core.store import (
-    ConflictException,
-    Labels,
-    LabelValue,
-    NotFoundException,
-    SearchResult,
-    Store,
-    ValueAndLabels,
-    ValueDict,
-)
+from ..core.models.types import Labels, LabelValue, ValueAndLabels, ValueDict
+from ..core.store import Store
 
 
 class InMemoryStore(Store):

@@ -3,33 +3,8 @@ from typing import Dict, Iterable, List, Optional, Set, TypedDict, Union
 
 from pydantic.types import JsonValue
 
-from .models.types import ConfigurationSupplier
-
-# Type variables for generic typing
-type LabelValue = Union[str, int, float, bool, None]
-type Labels = Dict[str, LabelValue]
-type ValueDict = Dict[ConfigurationSupplier, Dict[str, JsonValue]]
-
-
-class ValueAndLabels(TypedDict):
-    value: ValueDict
-    labels: Labels
-
-
-class SearchResult(ValueAndLabels):
-    primary_key: str
-
-
-class NotFoundException(Exception):
-    """Exception raised when a requested key is not found."""
-
-    pass
-
-
-class ConflictException(Exception):
-    """Exception raised when there's a conflict in the data."""
-
-    pass
+from .models.errors import ConflictException, NotFoundException
+from .models.types import Labels, SearchResult, ValueAndLabels, ValueDict
 
 
 class Store(ABC):

@@ -1,9 +1,18 @@
-from typing import Annotated, Dict, List, cast
+import logging
+import warnings
+from enum import StrEnum
+from typing import Annotated, Awaitable, Callable, Dict
 
-from fastapi import APIRouter, Body
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ValidationError
+from pydantic.types import JsonValue
 
+from .config import ConfigurationManager
 from .integration import Integration
+from .store import Store
+
+logger = logging.getLogger(__name__)
 
 
 class Catalog:
@@ -15,82 +24,222 @@ class Catalog:
     Helper functions must be used to create routes handlers for each integration because of scoping and closure issues.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        store: Store,
+        authenticate: Callable[..., Awaitable[tuple[str, tuple[str, ...]] | None]],
+    ):
+        self.finalized: bool = False
+        self._store = store
+        self._authenticate = authenticate
         self._integration_registry: Dict[str, Integration] = {}
 
     def add_integration(
         self,
         integration: Integration,
     ):
+        if self.finalized:
+            raise RuntimeError("Catalog is finalized, cannot add more integrations")
+        if integration.spec.guid in self._integration_registry:
+            raise ValueError(f"Integration {integration.spec.guid} already exists")
+        temp_manager = ConfigurationManager(integration.final_config_model)
+        admin_model = temp_manager.get_model("admin")
+        admin_model(**integration.supplied_config)  # validate admin supplied config
         self._integration_registry[integration.spec.guid] = integration
 
-    def _catalog_router(self) -> APIRouter:
-        router = APIRouter(prefix="/catalog", tags=["catalog"])
+    def finalize(self):
+        if self.finalized:
+            raise RuntimeError("Catalog is already finalized")
+        self.finalized = True
+        self._create_enabled_integrations_enum()  # order matters!
+        self._create_dependency_functions()
 
-        async def get_catalog():
+    def _create_enabled_integrations_enum(self):
+        members = {key.upper(): key for key in self._integration_registry.keys()}
+        self._enabled_integrations_enum = StrEnum("EnabledIntegrations", members)
+
+    def _create_dependency_functions(self):
+        self._require_authentication_dep = (
+            self._build_require_authentication_dependency()
+        )
+        self._validate_guid_dep = self._build_validate_guid_dependency()
+        self._load_manager_dep = self._build_load_manager_dependency()
+
+    def _build_require_authentication_dependency(self):
+
+        async def require_authentication(
+            identity: Annotated[
+                tuple[str, tuple[str, ...]] | None, Depends(self._authenticate)
+            ]
+        ):
+            if identity is None:
+                raise HTTPException(status_code=401, detail="Not authenticated")
+            return identity
+
+        return require_authentication
+
+    def _build_validate_guid_dependency(self):
+        async def validate_guid(guid: self._enabled_integrations_enum):  # type: ignore
+            if guid not in self._integration_registry:
+                raise HTTPException(status_code=404, detail="Integration not found")
+            return guid
+
+        return validate_guid
+
+    def _build_load_manager_dependency(self):
+
+        async def load_manager(
+            guid: Annotated[str, Depends(self._validate_guid_dep)],
+            identity: Annotated[
+                tuple[str, tuple[str, ...]], Depends(self._require_authentication_dep)
+            ],
+        ):
+            integration = self._integration_registry[guid]
+            manager = ConfigurationManager(integration.final_config_model)
+            keys = (*identity[1], guid)
+            instance_config = self._store.get(namespace=identity[0], keys=keys)
+            if instance_config is None:
+                return manager
+            for supplier, config in instance_config.items():
+                manager.add_configuration(supplier, config)
+            manager.add_configuration("admin", integration.supplied_config)
+
+            return manager
+
+        return load_manager
+
+    def _build_get_catalog_info_handler(self):
+        async def get_catalog_handler():
             return [
                 self._integration_registry[guid].spec.display
                 for guid in self._integration_registry
             ]
 
-        router.get("/")(get_catalog)
+        return get_catalog_handler
 
-        def create_get_integration(current_guid):
-            async def get_integration():
-                return self._integration_registry[current_guid].spec.display
+    def _build_get_enabled_integrations_handler(self):
+        async def get_enabled_integrations():
+            return list(self._integration_registry.keys())
 
-            return get_integration
+        return get_enabled_integrations
 
-        for guid in self._integration_registry:
-            router_path = f"/{guid}"
-            get_integration_handler = create_get_integration(guid)
-            router.get(router_path, tags=[guid])(get_integration_handler)
+    def _build_get_integration_info_handler(self):
+        async def get_integration(
+            guid: Annotated[str, Depends(self._validate_guid_dep)]
+        ):
+            return self._integration_registry[guid].spec.display
 
-        return router
+        return get_integration
 
-    def _connect_router(self) -> APIRouter:
-        router = APIRouter(prefix="/connect", tags=["connect"])
+    def _build_info_router(self) -> APIRouter:
+        info_router = APIRouter(tags=["info"])
 
-        def create_schema_handler(current_guid):
-            async def get_integration_schema():
-                integration = self._integration_registry[current_guid]
-                return integration.user_config_model.model_json_schema()
+        get_catalog_info_handler = self._build_get_catalog_info_handler()
+        info_router.get("/info")(get_catalog_info_handler)
 
-            return get_integration_schema
+        get_enabled_integrations_handler = (
+            self._build_get_enabled_integrations_handler()
+        )
+        info_router.get("/enabled")(get_enabled_integrations_handler)
 
-        def create_connect_handler(current_guid, current_model):
-            async def connect_integration(
-                config: Annotated[current_model, Body()]  # type: ignore
-            ):
-                integration = self._integration_registry[current_guid]
-                config_cast = cast(type[BaseModel], config)
-                return config_cast.model_json_schema()
+        get_integration_info_handler = self._build_get_integration_info_handler()
+        info_router.get("/{guid}/info")(get_integration_info_handler)
 
-            return connect_integration
+        return info_router
 
-        for guid in self._integration_registry:
-            router_path = f"/{guid}"
-            user_config_model = self._integration_registry[guid].user_config_model
+    def _build_get_integration_schema_handler(self):
+        """
+        Uses a temporary manager to avoid loading the configuration through the _load_manager_dep dependency.
+        """
 
-            schema_handler = create_schema_handler(guid)
-            connect_handler = create_connect_handler(guid, user_config_model)
+        async def get_integration_schema(
+            guid: Annotated[str, Depends(self._validate_guid_dep)]
+        ):
+            integration = self._integration_registry[guid]
+            temp_manager = ConfigurationManager(integration.final_config_model)
+            return temp_manager.get_json_schema("user")
 
-            router.get(router_path, tags=[guid])(schema_handler)
-            router.post(router_path, tags=[guid])(connect_handler)
+        return get_integration_schema
 
-        return router
+    def _build_get_integration_config_handler(self):
+        async def get_integration_config(
+            manager: Annotated[ConfigurationManager, Depends(self._load_manager_dep)],
+        ):
+            return manager.serialize_config("user")
 
-    def _webhook_router(self) -> APIRouter:
+        return get_integration_config
+
+    def _build_upsert_integration_config_handler(self):
+        async def upsert_integration_config(
+            manager: Annotated[ConfigurationManager, Depends(self._load_manager_dep)],
+            config: Annotated[Dict[str, JsonValue], Body(embed=True)],
+        ):
+            try:
+                manager.get_model("user")(**config)
+            except ValidationError as e:
+                raise RequestValidationError(e.errors())
+            print("hello")
+
+        return upsert_integration_config
+
+    def _build_connect_router(self) -> APIRouter:
+        base_router = APIRouter(
+            prefix="/{guid}",
+            tags=["connect"],
+            dependencies=[
+                Depends(self._require_authentication_dep),
+                Depends(self._validate_guid_dep),
+            ],
+        )  # base_router CANNOT have a path on /info, info is a reserved path for the info router
+
+        schema_router = APIRouter()
+
+        get_integration_schema_handler = self._build_get_integration_schema_handler()
+        schema_router.get("/schema")(get_integration_schema_handler)
+
+        management_router = APIRouter(dependencies=[Depends(self._load_manager_dep)])
+        get_integration_config_handler = self._build_get_integration_config_handler()
+        upsert_integration_config_handler = (
+            self._build_upsert_integration_config_handler()
+        )
+        management_router.post("/")(upsert_integration_config_handler)
+        management_router.get("/")(get_integration_config_handler)
+
+        base_router.include_router(schema_router)
+        base_router.include_router(management_router)
+        return base_router
+
+    def _build_webhook_router(self) -> APIRouter:
 
         router = APIRouter(prefix="/webhook", tags=["webhook"])
         return router
 
-    def serve(self, catalog: bool = True, connect: bool = True, webhook: bool = True):
-        routers: List[APIRouter] = []
-        if catalog:
-            routers.append(self._catalog_router())
+    def _build_admin_router(self) -> APIRouter:
+        router = APIRouter(prefix="/admin", tags=["admin"])
+        return router
+
+    def router(
+        self,
+        info: bool = True,
+        connect: bool = True,
+        webhook: bool = True,
+        admin: bool = False,
+    ) -> APIRouter:
+        if not self.finalized:
+            raise RuntimeError("Catalog is not finalized, cannot create router")
+        catalog_router = APIRouter(prefix="/catalog", tags=["catalog"])
+        if info:
+            catalog_router.include_router(self._build_info_router())
         if connect:
-            routers.append(self._connect_router())
+            catalog_router.include_router(self._build_connect_router())
         if webhook:
-            routers.append(self._webhook_router())
-        return routers
+            catalog_router.include_router(self._build_webhook_router())
+        if admin:
+            logger.warning(
+                "Admin routes are enabled. Ensure this router is properly secured."
+            )
+            warnings.warn(
+                "Admin routes are enabled. Ensure this router is properly secured."
+            )
+            catalog_router.include_router(self._build_admin_router())
+        return catalog_router

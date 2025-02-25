@@ -2,10 +2,11 @@ from dataclasses import dataclass
 from typing import Dict, Generic, TypeVar
 
 from pydantic import BaseModel
+from pydantic.types import JsonValue
 
-from .display import Display
-from .endpoint import Endpoint
-from .webhook import Webhook
+from .models.display import Display
+from .models.endpoint import Endpoint
+from .models.webhook import Webhook
 
 _AC = TypeVar("_AC", bound=BaseModel)
 
@@ -16,11 +17,11 @@ class Specification(Generic[_AC]):
     display: Display
     endpoints: Dict[str, Endpoint]
     webhooks: Dict[str, Webhook]
-    admin_config_model: type[_AC]
+    config_model: type[_AC]
 
 
 @dataclass
 class Integration(Generic[_AC]):
     spec: Specification[_AC]
-    admin_config: _AC
-    user_config_model: type[BaseModel]
+    final_config_model: type[_AC]
+    supplied_config: Dict[str, JsonValue]

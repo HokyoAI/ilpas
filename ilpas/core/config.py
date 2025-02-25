@@ -104,9 +104,19 @@ class ConfigurationManager(Generic[_T]):
         self._build_requirements()
 
     @classmethod
-    def restore(cls, config_class: type[_T], store: Store) -> "ConfigurationManager":
+    async def restore(
+        cls,
+        config_class: type[_T],
+        store: Store,
+        primary_key: str,
+        namespace: Optional[str],
+    ) -> "ConfigurationManager":
         """Restore the configuration from the store"""
         result = cls(config_class)
+        data = (await store.get_by_primary_key(primary_key, namespace))["value"]
+        for supplier, config in data.items():
+            result.add_configuration(supplier, config)
+        return result
 
     def _update_state(self) -> None:
         """Update the configuration state based on requirements and provided data"""
@@ -120,19 +130,6 @@ class ConfigurationManager(Generic[_T]):
             self._state = "partial"
         else:
             self._state = "pending"
-
-    def add_configuration(
-        self, supplier: ConfigurationSupplier, config_data: Dict[str, JsonValue]
-    ):
-        for key in config_data:
-            if key not in self._requirements:
-                raise ValueError(f"Field {key} is not a valid configuration field")
-            if self._requirements[key].supplier != supplier:
-                raise ValueError(
-                    f"Field {key} cannot be provided by supplier {supplier}"
-                )
-        self._config_data.update(config_data)
-        self._update_state()
 
     def get_model(self, supplier: ConfigurationSupplier) -> type[BaseModel]:
         """Generate a Pydantic model for fields from a specific source"""
@@ -151,6 +148,14 @@ class ConfigurationManager(Generic[_T]):
         DynamicModel = create_model(title, **field_defs)
         return DynamicModel
 
+    def add_configuration(
+        self, supplier: ConfigurationSupplier, config_data: Dict[str, JsonValue]
+    ):
+        model = self.get_model(supplier)
+        model(**config_data)
+        self._config_data.update(config_data)
+        self._update_state()
+
     def get_json_schema(self, supplier: ConfigurationSupplier) -> Dict[str, JsonValue]:
         """Generate JSON schema for fields from a specific source"""
 
@@ -165,7 +170,7 @@ class ConfigurationManager(Generic[_T]):
         }
         return supplier_data
 
-    def get_missing_requirements(
+    def get_requirements(
         self, supplier: ConfigurationSupplier
     ) -> List[ConfigurationRequirement]:
         """Get list of missing requirements for a specific source"""

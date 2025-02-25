@@ -30,6 +30,5 @@ def test():
     # manager.add_configuration(
     #     "admin", {"api_key": "xoxb-123456789012-123456789012-123456789012"}
     # )
-    # print(manager.get_missing_requirements("admin"))
     print(manager.get_json_schema("admin"))
     # print(manager.build_config())

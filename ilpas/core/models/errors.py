@@ -20,3 +20,9 @@ class ConflictException(IlpasError):
     """Exception raised when there's a conflict in the data."""
 
     pass
+
+
+class BadDataError(IlpasError):
+    """Exception raised when there is bad data in the store."""
+
+    pass

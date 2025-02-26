@@ -93,14 +93,14 @@ class Store(ABC):
         pass
 
     @abstractmethod
-    async def _create_pkey(
+    async def _insert_new_pkey(
         self, namespace: str, value: ValueDict, labels: Labels
     ) -> str:
         """Set the value and labels for a new primary key in the specified namespace."""
         pass
 
     @abstractmethod
-    async def _insert_new_pkey(
+    async def _insert_given_pkey(
         self, namespace: str, primary_key: str, value: ValueDict, labels: Labels
     ) -> str:
         """Insert a new primary key with the given value and labels."""
@@ -174,6 +174,7 @@ class Store(ABC):
         labels: Labels,
         primary_key: str,
         namespace: Optional[str] = None,
+        throw_on_dne: bool = False,
     ) -> str:
         """
         Store a value with a specified primary key in the specified namespace.
@@ -193,7 +194,9 @@ class Store(ABC):
                 namespace, primary_key, value, labels
             )
         else:
-            return await self._insert_new_pkey(namespace, primary_key, value, labels)
+            if throw_on_dne:
+                raise NotFoundException("primary key did not exist")
+            return await self._insert_given_pkey(namespace, primary_key, value, labels)
 
     async def put_by_labels(
         self,
@@ -225,7 +228,7 @@ class Store(ABC):
                 namespace, existing_key, value, labels
             )
         else:
-            return await self._create_pkey(namespace, value, labels)
+            return await self._insert_new_pkey(namespace, value, labels)
 
     async def get_by_primary_key(
         self, primary_key: str, namespace: Optional[str] = None

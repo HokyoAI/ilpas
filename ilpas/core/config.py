@@ -1,11 +1,13 @@
-from typing import Dict, Generic, List, Literal, Optional, TypeVar, cast
+from copy import deepcopy
+from typing import Dict, Generic, List, Optional, Type, TypeVar, cast, overload
 
 from pydantic import BaseModel, create_model
 from pydantic.fields import FieldInfo
 from pydantic.types import JsonValue
 
+from .models.errors import BadDataError, IlpasValueError
 from .models.types import ConfigurationState, ConfigurationSupplier
-from .store import Store
+from .store import Labels, Store
 
 DEFAULT_SUPPLIER: ConfigurationSupplier = "user"
 DEFAULT_SENSITIVE: bool = False
@@ -97,39 +99,111 @@ class ConfigurationManager(Generic[_T]):
                 sensitive=sensitive,
             )
 
-    def __init__(self, config_class: type[_T]):
+    @overload
+    def __init__(
+        self,
+        config_class: Type[_T],
+        guid: str,
+        *,
+        namespace: Optional[str],
+        primary_key: str,
+        labels: None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        config_class: Type[_T],
+        guid: str,
+        *,
+        namespace: Optional[str],
+        primary_key: None = None,
+        labels: Labels,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        config_class: Type[_T],
+        guid: str,
+        *,
+        namespace: Optional[str] = None,
+        primary_key: Optional[str] = None,
+        labels: Optional[Labels] = None,
+    ):
         self.config_class = config_class
+        self.guid: str = guid
+        self.namespace: Optional[str] = namespace
+        self.primary_key = primary_key
+        self.labels = labels
+        if primary_key is None and labels is None:
+            raise IlpasValueError("must supply at least primary_key or labels")
         self._config_data: Dict[str, JsonValue] = {}
         self._state: ConfigurationState = "pending"
         self._build_requirements()
 
+    @staticmethod
+    def _add_guid_to_labels_copy(guid: str, labels: Labels):
+        result = deepcopy(labels)
+        result["guid"] = guid
+        return result
+
+    @staticmethod
+    def _remove_guid_from_labels_copy(labels: Labels):
+        result = deepcopy(labels)
+        if "guid" not in result:
+            raise BadDataError("Expected to find guid in labels but did not")
+        result.pop("guid")
+        return result
+
     @classmethod
-    async def restore(
+    async def restore_by_primary_key(
         cls,
         config_class: type[_T],
         store: Store,
+        guid: str,
         primary_key: str,
         namespace: Optional[str],
     ) -> "ConfigurationManager":
         """Restore the configuration from the store"""
-        result = cls(config_class)
-        data = (await store.get_by_primary_key(primary_key, namespace))["value"]
-        for supplier, config in data.items():
+        data = await store.get_by_primary_key(primary_key, namespace)
+        all_labels = data["labels"]
+        original_labels = cls._remove_guid_from_labels_copy(all_labels)
+        value = data["value"]
+        result = cls(
+            config_class,
+            guid=guid,
+            primary_key=primary_key,
+            namespace=namespace,
+            labels=original_labels,
+        )
+        for supplier, config in value.items():
             result.add_configuration(supplier, config)
         return result
 
-    def _update_state(self) -> None:
-        """Update the configuration state based on requirements and provided data"""
-        required_fields = [
-            req.name for req in self._requirements.values() if req.required
-        ]
-
-        if all(field in self._config_data for field in required_fields):
-            self._state = "complete"
-        elif len(self._config_data) > 0:
-            self._state = "partial"
-        else:
-            self._state = "pending"
+    @classmethod
+    async def restore_by_labels(
+        cls,
+        config_class: type[_T],
+        store: Store,
+        guid: str,
+        labels: Labels,
+        namespace: Optional[str],
+    ) -> "ConfigurationManager":
+        """Restore the configuration from the store"""
+        all_labels = cls._add_guid_to_labels_copy(guid, labels)
+        data = await store.get_by_labels(all_labels, namespace)
+        value = data["value"]
+        primary_key = data["primary_key"]
+        result = cls(
+            config_class,
+            guid=guid,
+            primary_key=primary_key,
+            namespace=namespace,
+            labels=labels,
+        )
+        for supplier, config in value.items():
+            result.add_configuration(supplier, config)
+        return result
 
     def get_model(self, supplier: ConfigurationSupplier) -> type[BaseModel]:
         """Generate a Pydantic model for fields from a specific source"""
@@ -147,6 +221,24 @@ class ConfigurationManager(Generic[_T]):
 
         DynamicModel = create_model(title, **field_defs)
         return DynamicModel
+
+    async def _persist_state_by_primary_key(
+        self, store: Store, primary_key: str, namespace: Optional[str]
+    ):
+        pass
+
+    def _update_state(self) -> None:
+        """Update the configuration state based on requirements and provided data"""
+        required_fields = [
+            req.name for req in self._requirements.values() if req.required
+        ]
+
+        if all(field in self._config_data for field in required_fields):
+            self._state = "complete"
+        elif len(self._config_data) > 0:
+            self._state = "partial"
+        else:
+            self._state = "pending"
 
     def add_configuration(
         self, supplier: ConfigurationSupplier, config_data: Dict[str, JsonValue]
@@ -183,3 +275,6 @@ class ConfigurationManager(Generic[_T]):
     def build_model(self) -> Optional[_T]:
         """Try to build the final configuration model"""
         return self.config_class(**self._config_data)
+
+
+ConfigurationManager()

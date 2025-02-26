@@ -190,7 +190,7 @@ class InMemoryStore(Store):
         self._index_labels(namespace, primary_key, labels)
         return primary_key
 
-    async def _create_pkey(
+    async def _insert_new_pkey(
         self, namespace: str, value: ValueDict, labels: Labels
     ) -> str:
         """Set the value and labels for a new primary key in the specified namespace."""
@@ -201,7 +201,7 @@ class InMemoryStore(Store):
         self._index_labels(namespace, pkey, labels)
         return pkey
 
-    async def _insert_new_pkey(
+    async def _insert_given_pkey(
         self, namespace: str, primary_key: str, value: ValueDict, labels: Labels
     ) -> str:
         """Insert a new primary key with the given value and labels."""

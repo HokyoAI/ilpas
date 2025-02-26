@@ -1,7 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Iterable, List, Optional, Set, TypedDict, Union
-
-from pydantic.types import JsonValue
+from typing import Dict, Iterable, List, Optional, Set
 
 from .models.errors import ConflictException, NotFoundException
 from .models.types import Labels, SearchResult, ValueAndLabels, ValueDict
@@ -174,7 +172,7 @@ class Store(ABC):
         labels: Labels,
         primary_key: str,
         namespace: Optional[str] = None,
-        throw_on_dne: bool = False,
+        throw_on_not_found: bool = False,
     ) -> str:
         """
         Store a value with a specified primary key in the specified namespace.
@@ -194,7 +192,7 @@ class Store(ABC):
                 namespace, primary_key, value, labels
             )
         else:
-            if throw_on_dne:
+            if throw_on_not_found:
                 raise NotFoundException("primary key did not exist")
             return await self._insert_given_pkey(namespace, primary_key, value, labels)
 

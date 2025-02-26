@@ -5,12 +5,12 @@ from typing import Annotated, Awaitable, Callable, Dict
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 from pydantic.types import JsonValue
 
-from .config import ConfigurationManager
 from .integration import Integration
-from .store import Store
+from .manager import InstanceManager
+from .store import Labels, Store
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class Catalog:
     def __init__(
         self,
         store: Store,
-        authenticate: Callable[..., Awaitable[tuple[str, tuple[str, ...]] | None]],
+        authenticate: Callable[..., Awaitable[tuple[str, Labels] | None]],
     ):
         self.finalized: bool = False
         self._store = store
@@ -42,7 +42,9 @@ class Catalog:
             raise RuntimeError("Catalog is finalized, cannot add more integrations")
         if integration.spec.guid in self._integration_registry:
             raise ValueError(f"Integration {integration.spec.guid} already exists")
-        temp_manager = ConfigurationManager(integration.final_config_model)
+        temp_manager = InstanceManager(
+            integration.final_config_model, integration.spec.guid
+        )
         admin_model = temp_manager.get_model("admin")
         admin_model(**integration.supplied_config)  # validate admin supplied config
         self._integration_registry[integration.spec.guid] = integration
@@ -64,13 +66,12 @@ class Catalog:
         )
         self._validate_guid_dep = self._build_validate_guid_dependency()
         self._load_manager_dep = self._build_load_manager_dependency()
+        self._temp_manager_dep = self._build_temp_manager_dependency()
 
     def _build_require_authentication_dependency(self):
 
         async def require_authentication(
-            identity: Annotated[
-                tuple[str, tuple[str, ...]] | None, Depends(self._authenticate)
-            ]
+            identity: Annotated[tuple[str, Labels] | None, Depends(self._authenticate)]
         ):
             if identity is None:
                 raise HTTPException(status_code=401, detail="Not authenticated")
@@ -91,22 +92,29 @@ class Catalog:
         async def load_manager(
             guid: Annotated[str, Depends(self._validate_guid_dep)],
             identity: Annotated[
-                tuple[str, tuple[str, ...]], Depends(self._require_authentication_dep)
+                tuple[str, Labels], Depends(self._require_authentication_dep)
             ],
         ):
             integration = self._integration_registry[guid]
-            manager = ConfigurationManager(integration.final_config_model)
-            keys = (*identity[1], guid)
-            instance_config = self._store.get(namespace=identity[0], keys=keys)
-            if instance_config is None:
-                return manager
-            for supplier, config in instance_config.items():
-                manager.add_configuration(supplier, config)
+            manager = await InstanceManager.restore_by_labels(
+                store=self._store,
+                config_class=integration.final_config_model,
+                guid=guid,
+                labels=identity[1],
+                namespace=identity[0],
+            )
             manager.add_configuration("admin", integration.supplied_config)
-
             return manager
 
         return load_manager
+
+    def _build_temp_manager_dependency(self):
+
+        async def temp_manager(guid: Annotated[str, Depends(self._validate_guid_dep)]):
+            integration = self._integration_registry[guid]
+            return InstanceManager(integration.final_config_model, guid)
+
+        return temp_manager
 
     def _build_get_catalog_info_handler(self):
         async def get_catalog_handler():
@@ -153,17 +161,16 @@ class Catalog:
         """
 
         async def get_integration_schema(
-            guid: Annotated[str, Depends(self._validate_guid_dep)]
+            guid: Annotated[str, Depends(self._validate_guid_dep)],
+            temp_manager: Annotated[InstanceManager, Depends(self._temp_manager_dep)],
         ):
-            integration = self._integration_registry[guid]
-            temp_manager = ConfigurationManager(integration.final_config_model)
             return temp_manager.get_json_schema("user")
 
         return get_integration_schema
 
     def _build_get_integration_config_handler(self):
         async def get_integration_config(
-            manager: Annotated[ConfigurationManager, Depends(self._load_manager_dep)],
+            manager: Annotated[InstanceManager, Depends(self._load_manager_dep)],
         ):
             return manager.serialize_config("user")
 
@@ -171,7 +178,7 @@ class Catalog:
 
     def _build_upsert_integration_config_handler(self):
         async def upsert_integration_config(
-            manager: Annotated[ConfigurationManager, Depends(self._load_manager_dep)],
+            manager: Annotated[InstanceManager, Depends(self._load_manager_dep)],
             config: Annotated[Dict[str, JsonValue], Body(embed=True)],
         ):
             try:

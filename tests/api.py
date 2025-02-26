@@ -3,8 +3,8 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 
 from ilpas.core.catalog import Catalog
-from ilpas.core.config import ConfigurationManager, extras
 from ilpas.core.integration import Display, Integration, Specification
+from ilpas.core.manager import InstanceManager, extras
 from ilpas.dx.in_memory_store import InMemoryStore
 
 

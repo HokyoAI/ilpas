@@ -1,7 +1,7 @@
 from copy import deepcopy
-from typing import Dict, Generic, List, Optional, Type, TypeVar, cast, overload
+from typing import Dict, Generic, Literal, Optional, Type, TypeVar, cast, overload
 
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, ValidationError, create_model
 from pydantic.fields import FieldInfo
 from pydantic.types import JsonValue
 
@@ -13,15 +13,8 @@ DEFAULT_SUPPLIER: ConfigurationSupplier = "user"
 DEFAULT_SENSITIVE: bool = False
 
 
-class Nothing(BaseModel):
+class NoConfig(BaseModel):
     model_config = {"extra": "forbid"}
-
-
-class ConfigurationRequirement(BaseModel):
-    name: str
-    required: bool
-    supplier: ConfigurationSupplier
-    sensitive: bool = False
 
 
 def extras(
@@ -34,70 +27,47 @@ def extras(
 _T = TypeVar("_T", bound=BaseModel)
 
 
-class ConfigurationManager(Generic[_T]):
+class InstanceManager(Generic[_T]):
 
     def _is_field_required(self, field_info: FieldInfo) -> bool:
         """Check if a field is required based on its FieldInfo"""
         return field_info.is_required()
 
-    def _is_field_sensitive(self, field_info: FieldInfo) -> bool:
-        """Check if a field is sensitive based on its FieldInfo"""
-
+    def _get_extra_field[
+        T
+    ](
+        self, field_info: FieldInfo, field_name: str, field_type: type[T], default: T
+    ) -> T:
         if not field_info.json_schema_extra:
-            return DEFAULT_SENSITIVE
+            return default
         if isinstance(field_info.json_schema_extra, dict):
-            sensitive_value = field_info.json_schema_extra.get("sensitive", None)
-            if sensitive_value is None:
-                return DEFAULT_SENSITIVE
-            elif isinstance(sensitive_value, bool):
-                return sensitive_value
+            value = field_info.json_schema_extra.get(field_name, None)
+            if value is None:
+                return default
+            elif isinstance(value, field_type):
+                return value
             else:
                 raise ValueError(
-                    f"field {field_info.title} json_schema_extra.sensitive must be a bool"
+                    f"field {field_info.title} json_schema_extra.{field_name} must be a {field_type}"
                 )
         else:
             raise ValueError(
                 f"field {field_info.title} json_schema_extra must be a dict, callable is not supported"
             )
+
+    def _is_field_sensitive(self, field_info: FieldInfo) -> bool:
+        """Check if a field is sensitive based on its FieldInfo"""
+        return self._get_extra_field(field_info, "sensitive", bool, DEFAULT_SENSITIVE)
 
     def _get_field_supplier(self, field_info: FieldInfo) -> ConfigurationSupplier:
         """Get the supplier for a field based on its FieldInfo"""
-
-        if not field_info.json_schema_extra:
-            return DEFAULT_SUPPLIER
-        if isinstance(field_info.json_schema_extra, dict):
-            supplier_value = field_info.json_schema_extra.get("supplier", None)
-            if supplier_value is None:
-                return DEFAULT_SUPPLIER
-            elif isinstance(supplier_value, str) and supplier_value in [
-                "admin",
-                "user",
-                "callback",
-            ]:
-                return cast(ConfigurationSupplier, supplier_value)
-            else:
-                raise ValueError(
-                    f"field {field_info.title} json_schema_extra.supplier must be a str and one of 'admin', 'user', 'callback'"
-                )
+        supplier_string = self._get_extra_field(
+            field_info, "supplier", str, DEFAULT_SUPPLIER
+        )
+        if supplier_string not in ["user", "admin", "callback"]:
+            raise ValueError(f"Invalid supplier {supplier_string}")
         else:
-            raise ValueError(
-                f"field {field_info.title} json_schema_extra must be a dict, callable is not supported"
-            )
-
-    def _build_requirements(self) -> None:
-        """Build the requirements for the configuration based on the model"""
-        self._requirements: Dict[str, ConfigurationRequirement] = {}
-        fields = self.config_class.__pydantic_fields__
-        for field_name, field_info in fields.items():
-            required = self._is_field_required(field_info)
-            sensitive = self._is_field_sensitive(field_info)
-            supplier = self._get_field_supplier(field_info)
-            self._requirements[field_name] = ConfigurationRequirement(
-                name=field_name,
-                required=required,
-                supplier=supplier,
-                sensitive=sensitive,
-            )
+            return cast(ConfigurationSupplier, supplier_string)
 
     @overload
     def __init__(
@@ -108,6 +78,7 @@ class ConfigurationManager(Generic[_T]):
         namespace: Optional[str],
         primary_key: str,
         labels: None = None,
+        temporary: Literal[False] = False,
     ) -> None: ...
 
     @overload
@@ -119,6 +90,19 @@ class ConfigurationManager(Generic[_T]):
         namespace: Optional[str],
         primary_key: None = None,
         labels: Labels,
+        temporary: Literal[False] = False,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        config_class: Type[_T],
+        guid: str,
+        *,
+        namespace: None = None,
+        primary_key: None = None,
+        labels: None = None,
+        temporary: Literal[True] = True,
     ) -> None: ...
 
     def __init__(
@@ -129,17 +113,20 @@ class ConfigurationManager(Generic[_T]):
         namespace: Optional[str] = None,
         primary_key: Optional[str] = None,
         labels: Optional[Labels] = None,
+        temporary: bool = False,
     ):
         self.config_class = config_class
         self.guid: str = guid
         self.namespace: Optional[str] = namespace
         self.primary_key = primary_key
         self.labels = labels
-        if primary_key is None and labels is None:
-            raise IlpasValueError("must supply at least primary_key or labels")
+        self.temporary = temporary
+        if primary_key is None and labels is None and not temporary:
+            raise IlpasValueError(
+                "must provide either primary_key or labels, or set temporary=True"
+            )
         self._config_data: Dict[str, JsonValue] = {}
         self._state: ConfigurationState = "pending"
-        self._build_requirements()
 
     @staticmethod
     def _add_guid_to_labels_copy(guid: str, labels: Labels):
@@ -158,24 +145,26 @@ class ConfigurationManager(Generic[_T]):
     @classmethod
     async def restore_by_primary_key(
         cls,
-        config_class: type[_T],
         store: Store,
+        config_class: type[_T],
         guid: str,
         primary_key: str,
         namespace: Optional[str],
-    ) -> "ConfigurationManager":
+    ) -> "InstanceManager":
         """Restore the configuration from the store"""
         data = await store.get_by_primary_key(primary_key, namespace)
         all_labels = data["labels"]
-        original_labels = cls._remove_guid_from_labels_copy(all_labels)
+        original_labels = cls._remove_guid_from_labels_copy(
+            all_labels
+        )  # guid should be stored in the labels
         value = data["value"]
         result = cls(
             config_class,
             guid=guid,
             primary_key=primary_key,
             namespace=namespace,
-            labels=original_labels,
         )
+        result.labels = original_labels
         for supplier, config in value.items():
             result.add_configuration(supplier, config)
         return result
@@ -183,31 +172,32 @@ class ConfigurationManager(Generic[_T]):
     @classmethod
     async def restore_by_labels(
         cls,
-        config_class: type[_T],
         store: Store,
+        config_class: type[_T],
         guid: str,
         labels: Labels,
         namespace: Optional[str],
-    ) -> "ConfigurationManager":
+    ) -> "InstanceManager":
         """Restore the configuration from the store"""
-        all_labels = cls._add_guid_to_labels_copy(guid, labels)
+        all_labels = cls._add_guid_to_labels_copy(
+            guid, labels
+        )  # guid should be stored in the labels
         data = await store.get_by_labels(all_labels, namespace)
         value = data["value"]
         primary_key = data["primary_key"]
         result = cls(
             config_class,
             guid=guid,
-            primary_key=primary_key,
-            namespace=namespace,
             labels=labels,
+            namespace=namespace,
         )
+        result.primary_key = primary_key
         for supplier, config in value.items():
             result.add_configuration(supplier, config)
         return result
 
     def get_model(self, supplier: ConfigurationSupplier) -> type[BaseModel]:
         """Generate a Pydantic model for fields from a specific source"""
-        # Create a dynamic Pydantic model for the matching fields
         field_defs = {}
 
         for field_name, field_info in self.config_class.__pydantic_fields__.items():
@@ -221,32 +211,6 @@ class ConfigurationManager(Generic[_T]):
 
         DynamicModel = create_model(title, **field_defs)
         return DynamicModel
-
-    async def _persist_state_by_primary_key(
-        self, store: Store, primary_key: str, namespace: Optional[str]
-    ):
-        pass
-
-    def _update_state(self) -> None:
-        """Update the configuration state based on requirements and provided data"""
-        required_fields = [
-            req.name for req in self._requirements.values() if req.required
-        ]
-
-        if all(field in self._config_data for field in required_fields):
-            self._state = "complete"
-        elif len(self._config_data) > 0:
-            self._state = "partial"
-        else:
-            self._state = "pending"
-
-    def add_configuration(
-        self, supplier: ConfigurationSupplier, config_data: Dict[str, JsonValue]
-    ):
-        model = self.get_model(supplier)
-        model(**config_data)
-        self._config_data.update(config_data)
-        self._update_state()
 
     def get_json_schema(self, supplier: ConfigurationSupplier) -> Dict[str, JsonValue]:
         """Generate JSON schema for fields from a specific source"""
@@ -262,19 +226,34 @@ class ConfigurationManager(Generic[_T]):
         }
         return supplier_data
 
-    def get_requirements(
-        self, supplier: ConfigurationSupplier
-    ) -> List[ConfigurationRequirement]:
-        """Get list of missing requirements for a specific source"""
-        return [
-            req
-            for req in self._requirements.values()
-            if req.supplier == supplier and req.name not in self._config_data
-        ]
-
     def build_model(self) -> Optional[_T]:
         """Try to build the final configuration model"""
-        return self.config_class(**self._config_data)
+        try:
+            return self.config_class(**self._config_data)
+        except ValidationError as e:
+            return None
 
+    def _update_state(self) -> None:
+        """Update the configuration state based on requirements and provided data"""
 
-ConfigurationManager()
+        model = self.build_model()
+
+        if model is not None:
+            self._state = "complete"
+        elif len(self._config_data) > 0:
+            self._state = "partial"
+        else:
+            self._state = "pending"
+
+    def add_configuration(
+        self, supplier: ConfigurationSupplier, config_data: Dict[str, JsonValue]
+    ):
+        model = self.get_model(supplier)
+        model(**config_data)
+        self._config_data.update(config_data)
+        self._update_state()
+
+    async def _persist_state_by_primary_key(
+        self, store: Store, primary_key: str, namespace: Optional[str]
+    ):
+        pass

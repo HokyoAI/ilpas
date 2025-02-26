@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ilpas.core.config import ConfigurationManager, extras
+from ilpas.core.manager import InstanceManager, extras
 
 
 # Step 1: Integration Writer creates the base integration
@@ -30,7 +30,7 @@ class CustomSlackConfig(SlackIntegrationConfig):
 def test():
     """This works but doesn't provide auto completion for the settings object after"""
     load_dotenv(override=True)
-    manager = ConfigurationManager(CustomSlackConfig)
+    manager = InstanceManager(CustomSlackConfig)
 
     class Settings(BaseSettings):
         model_config = SettingsConfigDict(env_nested_delimiter="__")

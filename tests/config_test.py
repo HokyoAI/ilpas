@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 
-from ilpas.core.config import ConfigurationManager, extras
+from ilpas.core.manager import InstanceManager, extras
 
 
 # Step 1: Integration Writer creates the base integration
@@ -26,7 +26,7 @@ class CustomSlackConfig(SlackIntegrationConfig):
 
 
 def test():
-    manager = ConfigurationManager(CustomSlackConfig)
+    manager = InstanceManager(CustomSlackConfig)
     # manager.add_configuration(
     #     "admin", {"api_key": "xoxb-123456789012-123456789012-123456789012"}
     # )

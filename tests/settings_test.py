@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ilpas.core.manager import InstanceManager, extras
+from ilpas.core.instance import InstanceManager, extras
 
 
 # Step 1: Integration Writer creates the base integration

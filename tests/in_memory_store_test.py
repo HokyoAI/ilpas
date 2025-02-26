@@ -24,20 +24,23 @@ async def populated_store(store: InMemoryStore) -> InMemoryStore:
         "callback": {"token": "1234567890"},
     }
     await store.put_by_primary_key(
-        value1,
-        {"guid": "slack", "user_id": "123"},
+        value=value1,
+        guid="slack",
+        labels={"user_id": "123"},
         namespace="default",
         primary_key="1",
     )
     await store.put_by_primary_key(
-        value2,
-        {"guid": "slack", "user_id": "456"},
+        value=value2,
+        labels={"user_id": "456"},
+        guid="slack",
         namespace="default",
         primary_key="2",
     )
     await store.put_by_primary_key(
-        value3,
-        {"guid": "github", "user_id": "123"},
+        value=value3,
+        guid="github",
+        labels={"user_id": "123"},
         namespace="default",
         primary_key="3",
     )
@@ -57,24 +60,42 @@ async def multi_namespace_store(
         "callback": {"token": "1234567890"},
     }
     pkey1 = await store.put_by_labels(
-        value1, {"guid": "slack", "user_id": "123"}, namespace="ns1"
+        value=value1, guid="slack", labels={"user_id": "123"}, namespace="ns1"
     )
     pkey2 = await store.put_by_labels(
-        value2, {"guid": "slack", "user_id": "456"}, namespace="ns2"
+        value=value2, guid="slack", labels={"user_id": "456"}, namespace="ns2"
     )
     pkey3 = await store.put_by_labels(
-        value3, {"guid": "github", "user_id": "123"}, namespace="ns1"
+        value=value3, guid="github", labels={"user_id": "123"}, namespace="ns1"
     )
     return store, pkey1, pkey2, pkey3
 
 
 @pytest.mark.asyncio
-async def test_find_primary_keys_by_labels(populated_store: InMemoryStore):
+async def test_find_primary_keys_by_guid(populated_store: InMemoryStore):
     """Test finding primary keys by labels."""
     keys = await populated_store._find_primary_keys_by_labels(
-        namespace="default", labels={"guid": "slack"}
+        namespace="default", labels={}, guid="slack"
     )
     assert keys == {"1", "2"}
+
+
+@pytest.mark.asyncio
+async def test_find_primary_keys_by_labels_and_guid(populated_store: InMemoryStore):
+    """Test finding primary keys by labels."""
+    keys = await populated_store._find_primary_keys_by_labels(
+        namespace="default", labels={"user_id": "123"}, guid="slack"
+    )
+    assert keys == {"1"}
+
+
+@pytest.mark.asyncio
+async def test_find_primary_keys_by_labels_no_guid(populated_store: InMemoryStore):
+    """Test finding primary keys by labels."""
+    keys = await populated_store._find_primary_keys_by_labels(
+        namespace="default", labels={"user_id": "123"}, guid=None
+    )
+    assert keys == {"1", "3"}
 
 
 @pytest.mark.asyncio
@@ -82,14 +103,21 @@ async def test_put_by_primary_key(store: InMemoryStore):
     """Test storing a value with labels."""
     value: ValueDict = {"user": {"key1": "bar"}, "admin": {"a": False, "b": 42}}
     primary_key = await store.put_by_primary_key(
-        value, {"guid": "slack", "user_id": "123"}, namespace="default", primary_key="1"
+        value=value,
+        guid="slack",
+        labels={"user_id": "123"},
+        namespace="default",
+        primary_key="1",
     )
-    result = await store.get_by_primary_key(primary_key, namespace="default")
+    result = await store.get_by_primary_key(
+        primary_key=primary_key, namespace="default"
+    )
     result2 = await store.get_by_labels(
-        {"guid": "slack", "user_id": "123"}, namespace="default"
+        guid="slack", labels={"user_id": "123"}, namespace="default"
     )
     assert result["value"] == result2["value"] == value
-    assert result["labels"] == result2["labels"] == {"guid": "slack", "user_id": "123"}
+    assert result["labels"] == result2["labels"] == {"user_id": "123"}
+    assert result["guid"] == result2["guid"] == "slack"
     assert result["primary_key"] == result2["primary_key"] == "1"
 
 
@@ -98,15 +126,18 @@ async def test_put_by_labels(store: InMemoryStore):
     """Test storing a value without specifying a primary key."""
     value: ValueDict = {"user": {"key1": "bar"}, "admin": {"a": False, "b": 42}}
     primary_key = await store.put_by_labels(
-        value, {"guid": "slack", "user_id": "123"}, namespace="default"
+        value=value, guid="slack", labels={"user_id": "123"}, namespace="default"
     )
     assert primary_key is not None
-    result = await store.get_by_primary_key(primary_key, namespace="default")
+    result = await store.get_by_primary_key(
+        primary_key=primary_key, namespace="default"
+    )
     result2 = await store.get_by_labels(
-        {"guid": "slack", "user_id": "123"}, namespace="default"
+        guid="slack", labels={"user_id": "123"}, namespace="default"
     )
     assert result["value"] == result2["value"] == value
-    assert result["labels"] == result2["labels"] == {"guid": "slack", "user_id": "123"}
+    assert result["labels"] == result2["labels"] == {"user_id": "123"}
+    assert result["guid"] == result2["guid"] == "slack"
 
 
 @pytest.mark.asyncio
@@ -114,21 +145,23 @@ async def test_put_without_namespace(store: InMemoryStore):
     """Test storing a value without specifying a namespace."""
     value: ValueDict = {"user": {"key1": "bar"}, "admin": {"a": False, "b": 42}}
     primary_key = await store.put_by_labels(
-        value, labels={"guid": "slack", "user_id": "123"}
+        value=value, guid="slack", labels={"user_id": "123"}
     )
     assert primary_key is not None
-    result = await store.get_by_primary_key(primary_key)
-    result2 = await store.get_by_labels({"guid": "slack", "user_id": "123"})
+    result = await store.get_by_primary_key(primary_key=primary_key)
+    result2 = await store.get_by_labels(guid="slack", labels={"user_id": "123"})
     assert result["value"] == result2["value"] == value
-    assert result["labels"] == result2["labels"] == {"guid": "slack", "user_id": "123"}
+    assert result["labels"] == result2["labels"] == {"user_id": "123"}
+    assert result["guid"] == result2["guid"] == "slack"
 
 
 @pytest.mark.asyncio
 async def test_put_without_labels(store: InMemoryStore):
     """Test storing a value without specifying labels."""
     value: ValueDict = {"user": {"key1": "bar"}, "admin": {"a": False, "b": 42}}
-    primary_key = await store.put_by_labels(value, {})
-    result = await store.get_by_primary_key(primary_key)
-    result2 = await store.get_by_labels({})
+    primary_key = await store.put_by_labels(value=value, guid="slack", labels={})
+    result = await store.get_by_primary_key(primary_key=primary_key)
+    result2 = await store.get_by_labels(guid="slack", labels={})
     assert result["value"] == result2["value"] == value
     assert result["labels"] == result2["labels"] == {}
+    assert result["guid"] == result2["guid"] == "slack"

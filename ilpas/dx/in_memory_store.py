@@ -1,6 +1,8 @@
-from typing import Dict, Iterable, Set
+from copy import deepcopy
+from typing import Dict, Iterable, Optional, Set
 from uuid import uuid4
 
+from ..core.models.errors import BadDataError
 from ..core.models.types import Labels, LabelValue, ValueAndLabels, ValueDict
 from ..core.store import Store
 
@@ -24,7 +26,8 @@ class InMemoryStore(Store):
         #   namespace1: {
         #     primary_key1: {
         #       "value": value1,
-        #       "labels": {label1: value1, ...}
+        #       "labels": {label1: value1, ...},
+        #       "guid": guid1
         #     },
         #     ...
         #   },
@@ -51,16 +54,30 @@ class InMemoryStore(Store):
         # }
         self.label_index: Dict[str, Dict[str, Dict[LabelValue, Set[str]]]] = {}
 
+        # guid index for efficient lookup:
+        # {
+        #   namespace1: {
+        #     guid: {
+        #       value1: {primary_key1, primary_key2, ...},
+        #       ...
+        #     },
+        #     ...
+        #   },
+        #   ...
+        # }
+        self.guid_index: Dict[str, Dict[str, Set[str]]] = {}
+
     async def _check_namespace(self, namespace):
         return namespace in self.store
 
     async def _create_namespace(self, namespace: str) -> None:
         """Create a namespace if it does not exist."""
         self.label_index[namespace] = {}
+        self.guid_index[namespace] = {}
         self.store[namespace] = {}
 
     async def _find_primary_keys_by_labels(
-        self, namespace: str, labels: Labels
+        self, *, guid: Optional[str], namespace: str, labels: Labels
     ) -> Set[str]:
         """Find primary keys by labels. If no labels are provided, return all primary keys in given namespace.
 
@@ -72,9 +89,14 @@ class InMemoryStore(Store):
             A set of primary keys matching the labels
         """
         matching_primary_keys: Set[str] | None = None
-
-        if not labels:
+        if not labels and guid is None:
             return set(self.store[namespace].keys())
+
+        if guid is not None:
+            if guid not in self.guid_index[namespace]:
+                return set()
+            else:
+                matching_primary_keys = self.guid_index[namespace][guid]
 
         for label_key, label_value in labels.items():
             if label_key not in self.label_index[namespace]:
@@ -95,7 +117,7 @@ class InMemoryStore(Store):
         return matching_primary_keys
 
     async def _get_values_of_primary_keys(
-        self, namespace: str, primary_keys: Iterable[str]
+        self, *, namespace: str, primary_keys: Iterable[str]
     ) -> Dict[str, ValueAndLabels]:
         """
         Retrieve the values of primary keys from the specified namespace.
@@ -113,7 +135,7 @@ class InMemoryStore(Store):
         return result
 
     async def _check_primary_keys(
-        self, primary_keys: Iterable[str], namespace: str
+        self, *, primary_keys: Iterable[str], namespace: str
     ) -> bool:
         """
         Check if the primary keys exists in the specified namespace.
@@ -126,7 +148,7 @@ class InMemoryStore(Store):
                 return False
         return True
 
-    def _add_new_label(self, namespace: str, label_key: str, primary_key) -> None:
+    def _add_new_label(self, *, namespace: str, label_key: str, primary_key) -> None:
         """
         Add a new label key to the label index.
         For all existing records in the namespace, initialize their label values to None.
@@ -140,19 +162,44 @@ class InMemoryStore(Store):
                 self.label_index[namespace][label_key][None].add(pkey)
                 self.store[namespace][pkey]["labels"][label_key] = None
 
-    def _index_labels(self, namespace: str, primary_key: str, labels: Labels) -> None:
+    def _add_new_guid(self, *, namespace: str, guid: str, primary_key) -> None:
+        """
+        Add a new guid to the guid index.
+        For all existing records in the namespace, initialize their guid values to None.
+        """
+        if guid not in self.guid_index[namespace]:
+            self.guid_index[namespace][guid] = set()
+
+    def _index_labels(
+        self, *, namespace: str, primary_key: str, guid: str, labels: Labels
+    ) -> None:
         """Index labels for efficient lookup."""
+        if guid not in self.guid_index[namespace]:
+            self._add_new_guid(namespace=namespace, guid=guid, primary_key=primary_key)
+        self.guid_index[namespace][guid].add(primary_key)
+
         for label_key, label_value in labels.items():
             if label_key not in self.label_index[namespace]:
-                self._add_new_label(namespace, label_key, primary_key)
+                self._add_new_label(
+                    namespace=namespace, label_key=label_key, primary_key=primary_key
+                )
 
             if label_value not in self.label_index[namespace][label_key]:
                 self.label_index[namespace][label_key][label_value] = set()
 
             self.label_index[namespace][label_key][label_value].add(primary_key)
 
-    def _deindex_labels(self, namespace: str, primary_key: str, labels: Labels) -> None:
+    def _deindex_labels(
+        self, *, namespace: str, primary_key: str, guid: str, labels: Labels
+    ) -> None:
         """Remove label indices for a record."""
+        if guid in self.guid_index[namespace]:
+            self.guid_index[namespace][guid].discard(primary_key)
+
+            # Clean up empty sets
+            if not self.guid_index[namespace][guid]:
+                del self.guid_index[namespace][guid]
+
         for label_key, label_value in labels.items():
             if (
                 label_key in self.label_index[namespace]
@@ -168,7 +215,7 @@ class InMemoryStore(Store):
                 if not self.label_index[namespace][label_key]:
                     del self.label_index[namespace][label_key]
 
-    async def _delete(self, primary_key: str, namespace: str) -> None:
+    async def _delete(self, *, primary_key: str, namespace: str) -> None:
         """
         Delete a value by its primary key from the specified namespace.
 
@@ -178,33 +225,76 @@ class InMemoryStore(Store):
 
         """
         values_and_labels = self.store[namespace].pop(primary_key)
-        self._deindex_labels(namespace, primary_key, values_and_labels["labels"])
+        self._deindex_labels(
+            namespace=namespace,
+            primary_key=primary_key,
+            guid=values_and_labels["guid"],
+            labels=values_and_labels["labels"],
+        )
 
     async def _update_existing_pkey(
-        self, namespace: str, primary_key: str, value: ValueDict, labels: Labels
+        self,
+        *,
+        namespace: str,
+        primary_key: str,
+        value: ValueDict,
+        guid: str,
+        labels: Labels,
     ) -> str:
         """Set the value and labels for an existing primary key in the specified namespace."""
         current_labels = self.store[namespace][primary_key]["labels"]
-        self._deindex_labels(namespace, primary_key, current_labels)
-        self.store[namespace][primary_key] = {"value": value, "labels": labels}
-        self._index_labels(namespace, primary_key, labels)
+        current_guid = self.store[namespace][primary_key]["guid"]
+        if current_guid != guid:
+            raise BadDataError("GUID cannot be updated")
+        self._deindex_labels(
+            namespace=namespace,
+            primary_key=primary_key,
+            guid=guid,
+            labels=current_labels,
+        )
+        self.store[namespace][primary_key] = {
+            "value": value,
+            "labels": labels,
+            "guid": guid,
+        }
+        self._index_labels(
+            namespace=namespace, primary_key=primary_key, guid=guid, labels=labels
+        )
         return primary_key
 
     async def _insert_new_pkey(
-        self, namespace: str, value: ValueDict, labels: Labels
+        self, *, namespace: str, value: ValueDict, guid: str, labels: Labels
     ) -> str:
         """Set the value and labels for a new primary key in the specified namespace."""
         pkey = str(uuid4())
-        if await self._check_primary_keys([pkey], namespace):
+        if await self._check_primary_keys(primary_keys=[pkey], namespace=namespace):
             raise RuntimeError("UUID collision")
-        self.store[namespace][pkey] = {"value": value, "labels": labels}
-        self._index_labels(namespace, pkey, labels)
+        self.store[namespace][pkey] = {
+            "value": value,
+            "labels": labels,
+            "guid": guid,
+        }
+        self._index_labels(
+            namespace=namespace, primary_key=pkey, guid=guid, labels=labels
+        )
         return pkey
 
     async def _insert_given_pkey(
-        self, namespace: str, primary_key: str, value: ValueDict, labels: Labels
+        self,
+        *,
+        namespace: str,
+        primary_key: str,
+        value: ValueDict,
+        guid: str,
+        labels: Labels,
     ) -> str:
         """Insert a new primary key with the given value and labels."""
-        self.store[namespace][primary_key] = {"value": value, "labels": labels}
-        self._index_labels(namespace, primary_key, labels)
+        self.store[namespace][primary_key] = {
+            "value": value,
+            "labels": labels,
+            "guid": guid,
+        }
+        self._index_labels(
+            namespace=namespace, primary_key=primary_key, guid=guid, labels=labels
+        )
         return primary_key

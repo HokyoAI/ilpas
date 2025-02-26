@@ -3,13 +3,13 @@ import warnings
 from enum import StrEnum
 from typing import Annotated, Awaitable, Callable, Dict
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from pydantic.types import JsonValue
 
+from .instance import Instance
 from .integration import Integration
-from .manager import InstanceManager
 from .store import Labels, Store
 
 logger = logging.getLogger(__name__)
@@ -42,11 +42,9 @@ class Catalog:
             raise RuntimeError("Catalog is finalized, cannot add more integrations")
         if integration.spec.guid in self._integration_registry:
             raise ValueError(f"Integration {integration.spec.guid} already exists")
-        temp_manager = InstanceManager(
-            integration.final_config_model, integration.spec.guid
-        )
-        admin_model = temp_manager.get_model("admin")
-        admin_model(**integration.supplied_config)  # validate admin supplied config
+        Instance(
+            integration
+        )  # this is a temporary instance to validate the supplied config
         self._integration_registry[integration.spec.guid] = integration
 
     def finalize(self):
@@ -65,8 +63,8 @@ class Catalog:
             self._build_require_authentication_dependency()
         )
         self._validate_guid_dep = self._build_validate_guid_dependency()
-        self._load_manager_dep = self._build_load_manager_dependency()
-        self._temp_manager_dep = self._build_temp_manager_dependency()
+        self._load_instance_dep = self._build_load_instance_dependency()
+        self._temp_instance_dep = self._build_temp_instance_dependency()
 
     def _build_require_authentication_dependency(self):
 
@@ -87,34 +85,33 @@ class Catalog:
 
         return validate_guid
 
-    def _build_load_manager_dependency(self):
+    def _build_load_instance_dependency(self):
 
-        async def load_manager(
+        async def load_instance(
             guid: Annotated[str, Depends(self._validate_guid_dep)],
             identity: Annotated[
                 tuple[str, Labels], Depends(self._require_authentication_dep)
             ],
         ):
             integration = self._integration_registry[guid]
-            manager = await InstanceManager.restore_by_labels(
+            instance = await Instance.restore_by_labels(
                 store=self._store,
-                config_class=integration.final_config_model,
-                guid=guid,
+                integration=integration,
                 labels=identity[1],
                 namespace=identity[0],
             )
-            manager.add_configuration("admin", integration.supplied_config)
-            return manager
+            instance.add_configuration("admin", integration.supplied_config)
+            return instance
 
-        return load_manager
+        return load_instance
 
-    def _build_temp_manager_dependency(self):
+    def _build_temp_instance_dependency(self):
 
-        async def temp_manager(guid: Annotated[str, Depends(self._validate_guid_dep)]):
+        async def temp_instance(guid: Annotated[str, Depends(self._validate_guid_dep)]):
             integration = self._integration_registry[guid]
-            return InstanceManager(integration.final_config_model, guid)
+            return Instance(integration)
 
-        return temp_manager
+        return temp_instance
 
     def _build_get_catalog_info_handler(self):
         async def get_catalog_handler():
@@ -139,93 +136,108 @@ class Catalog:
 
         return get_integration
 
+    def _build_get_integration_schema_handler(self):
+        """
+        Uses a temporary instance to avoid loading the configuration through the _load_instance_dep dependency.
+        """
+
+        async def get_integration_schema(
+            temp_instance: Annotated[Instance, Depends(self._temp_instance_dep)],
+        ):
+            return temp_instance.get_json_schema("user")
+
+        return get_integration_schema
+
     def _build_info_router(self) -> APIRouter:
         info_router = APIRouter(tags=["info"])
 
         get_catalog_info_handler = self._build_get_catalog_info_handler()
-        info_router.get("/info")(get_catalog_info_handler)
-
         get_enabled_integrations_handler = (
             self._build_get_enabled_integrations_handler()
         )
-        info_router.get("/enabled")(get_enabled_integrations_handler)
-
         get_integration_info_handler = self._build_get_integration_info_handler()
+        get_integration_schema_handler = self._build_get_integration_schema_handler()
+        info_router.get("/info")(get_catalog_info_handler)
+        info_router.get("/enabled")(get_enabled_integrations_handler)
         info_router.get("/{guid}/info")(get_integration_info_handler)
+        info_router.get("/{guid}/schema")(get_integration_schema_handler)
 
         return info_router
 
-    def _build_get_integration_schema_handler(self):
-        """
-        Uses a temporary manager to avoid loading the configuration through the _load_manager_dep dependency.
-        """
-
-        async def get_integration_schema(
-            guid: Annotated[str, Depends(self._validate_guid_dep)],
-            temp_manager: Annotated[InstanceManager, Depends(self._temp_manager_dep)],
+    def _build_get_integration_user_config_handler(self):
+        async def get_integration_user_config(
+            instance: Annotated[Instance, Depends(self._load_instance_dep)],
         ):
-            return temp_manager.get_json_schema("user")
+            return instance.serialize_config("user")
 
-        return get_integration_schema
+        return get_integration_user_config
 
-    def _build_get_integration_config_handler(self):
-        async def get_integration_config(
-            manager: Annotated[InstanceManager, Depends(self._load_manager_dep)],
-        ):
-            return manager.serialize_config("user")
-
-        return get_integration_config
-
-    def _build_put_integration_config_handler(self):
-        async def put_integration_config(
-            manager: Annotated[InstanceManager, Depends(self._load_manager_dep)],
+    def _build_put_integration_user_config_handler(self):
+        async def put_integration_user_config(
+            instance: Annotated[Instance, Depends(self._load_instance_dep)],
             config: Annotated[Dict[str, JsonValue], Body(embed=True)],
         ):
             try:
-                manager.get_model("user")(**config)
+                instance.get_model("user")(**config)
             except ValidationError as e:
                 raise RequestValidationError(e.errors())
-            manager.add_configuration("user", config)
+            instance.add_configuration("user", config)
             # need some way to save the config to store
 
-        return put_integration_config
+        return put_integration_user_config
+
+    def _build_delete_integration_instance_handler(self):
+        async def delete_integration_instance(
+            instance: Annotated[Instance, Depends(self._load_instance_dep)]
+        ):
+            await instance.delete(self._store)
+
+        return delete_integration_instance
 
     def _build_integration_config_callback_handler(self):
         async def integration_config_callback(
             guid: Annotated[str, Depends(self._validate_guid_dep)],
-            config: Annotated[Dict[str, JsonValue], Body(embed=True)],
+            request: Request,
         ):
             integration = self._integration_registry[guid]
-            try:
-                integration.config_callback(config)
-            except ValidationError as e:
-                raise RequestValidationError(e.errors())
-            # need some way to save the config to store
+            if integration.spec.callback is None:
+                raise HTTPException(
+                    status_code=404, detail="This integration does not accept callbacks"
+                )
+            params = request.query_params
+
+        return integration_config_callback
 
     def _build_connect_router(self) -> APIRouter:
         base_router = APIRouter(
             prefix="/{guid}",
             tags=["connect"],
             dependencies=[
-                Depends(self._require_authentication_dep),
                 Depends(self._validate_guid_dep),
             ],
-        )  # base_router CANNOT have a path on /info, info is a reserved path for the info router
+        )  # base_router CANNOT have a path on /info or /schema, reserved paths for the info router
 
-        schema_router = APIRouter()
+        management_router = APIRouter(
+            dependencies=[
+                Depends(self._require_authentication_dep),
+                Depends(self._load_instance_dep),
+            ]
+        )
+        get_integration_user_config_handler = (
+            self._build_get_integration_user_config_handler()
+        )
+        put_integration_user_config_handler = (
+            self._build_put_integration_user_config_handler()
+        )
+        management_router.get("/")(get_integration_user_config_handler)
+        management_router.put("/")(put_integration_user_config_handler)
 
-        get_integration_schema_handler = self._build_get_integration_schema_handler()
-        schema_router.get("/schema")(get_integration_schema_handler)
+        callback_router = APIRouter()
+        integration_callback_handler = self._build_integration_config_callback_handler()
+        callback_router.get("/callback")(integration_callback_handler)
 
-        management_router = APIRouter(dependencies=[Depends(self._load_manager_dep)])
-        get_integration_config_handler = self._build_get_integration_config_handler()
-        put_integration_config_handler = self._build_put_integration_config_handler()
-
-        management_router.put("/")(put_integration_config_handler)
-        management_router.get("/")(get_integration_config_handler)
-
-        base_router.include_router(schema_router)
         base_router.include_router(management_router)
+        base_router.include_router(callback_router)
         return base_router
 
     def _build_webhook_router(self) -> APIRouter:

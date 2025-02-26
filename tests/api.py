@@ -3,8 +3,8 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 
 from ilpas.core.catalog import Catalog
-from ilpas.core.integration import Display, Integration, Specification
-from ilpas.core.manager import InstanceManager, extras
+from ilpas.core.integration import Callback, Display, Integration, Specification
+from ilpas.core.instance import InstanceManager, extras
 from ilpas.dx.in_memory_store import InMemoryStore
 
 
@@ -26,9 +26,10 @@ Slack = Specification(
         description="Slack integration",
         logo_url="https://slack.com/favicon.ico",
     ),
+    config_model=SlackIntegrationConfig,
+    callback=None,
     endpoints={},
     webhooks={},
-    config_model=SlackIntegrationConfig,
 )
 
 SlackV2 = Specification(
@@ -38,9 +39,10 @@ SlackV2 = Specification(
         description="Slack integration V2",
         logo_url="https://slack.com/favicon.ico",
     ),
+    config_model=SlackIntegrationConfig,
+    callback=Callback()
     endpoints={},
     webhooks={},
-    config_model=SlackIntegrationConfig,
 )
 
 

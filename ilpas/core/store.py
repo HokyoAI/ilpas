@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from typing import Dict, Iterable, List, Optional, Set
 
-from .models.errors import ConflictException, NotFoundException
+from .models.errors import BadDataError, ConflictException, NotFoundException
 from .models.types import Labels, SearchResult, ValueAndLabels, ValueDict
 
 
@@ -30,7 +31,7 @@ class Store(ABC):
 
     @abstractmethod
     async def _find_primary_keys_by_labels(
-        self, namespace: str, labels: Labels
+        self, *, namespace: str, guid: Optional[str], labels: Labels
     ) -> Set[str]:
         """Find primary keys by labels. If no labels are provided, return all primary keys in given namespace.
 
@@ -45,7 +46,7 @@ class Store(ABC):
 
     @abstractmethod
     async def _get_values_of_primary_keys(
-        self, namespace: str, primary_keys: Iterable[str]
+        self, *, namespace: str, primary_keys: Iterable[str]
     ) -> Dict[str, ValueAndLabels]:
         """
         Retrieve the values of primary keys from the specified namespace.
@@ -61,7 +62,7 @@ class Store(ABC):
 
     @abstractmethod
     async def _check_primary_keys(
-        self, primary_keys: Iterable[str], namespace: str
+        self, *, primary_keys: Iterable[str], namespace: str
     ) -> bool:
         """
         Check if the primary keys exists in the specified namespace.
@@ -72,7 +73,7 @@ class Store(ABC):
         pass
 
     @abstractmethod
-    async def _delete(self, primary_key: str, namespace: str) -> None:
+    async def _delete(self, *, primary_key: str, namespace: str) -> None:
         """
         Delete a value by its primary key from the specified namespace.
 
@@ -85,23 +86,43 @@ class Store(ABC):
 
     @abstractmethod
     async def _update_existing_pkey(
-        self, namespace: str, primary_key: str, value: ValueDict, labels: Labels
+        self,
+        *,
+        namespace: str,
+        guid: str,
+        primary_key: str,
+        value: ValueDict,
+        labels: Labels,
     ) -> str:
         """Set the value and labels for an existing primary key in the specified namespace."""
         pass
 
     @abstractmethod
     async def _insert_new_pkey(
-        self, namespace: str, value: ValueDict, labels: Labels
+        self,
+        *,
+        namespace: str,
+        guid: str,
+        value: ValueDict,
+        labels: Labels,
     ) -> str:
         """Set the value and labels for a new primary key in the specified namespace."""
         pass
 
     @abstractmethod
     async def _insert_given_pkey(
-        self, namespace: str, primary_key: str, value: ValueDict, labels: Labels
+        self,
+        *,
+        namespace: str,
+        guid: str,
+        primary_key: str,
+        value: ValueDict,
+        labels: Labels,
     ) -> str:
-        """Insert a new primary key with the given value and labels."""
+        """
+        Insert a new primary key with the given value and labels.
+        If the primary key already exists, throw a ConflictException.
+        """
         pass
 
     def _get_namespace_name(self, namespace: Optional[str]) -> str:
@@ -166,9 +187,25 @@ class Store(ABC):
         else:
             return primary_keys.pop()
 
+    # @staticmethod
+    # def _add_guid_to_labels_copy(*, guid: str, labels: Labels):
+    #     result = deepcopy(labels)
+    #     result["guid"] = guid
+    #     return result
+
+    # @staticmethod
+    # def _remove_guid_from_labels_copy(labels: Labels):
+    #     result = deepcopy(labels)
+    #     if "guid" not in result:
+    #         raise BadDataError("Expected to find guid in labels but did not")
+    #     result.pop("guid")
+    #     return result
+
     async def put_by_primary_key(
         self,
+        *,
         value: ValueDict,
+        guid: str,
         labels: Labels,
         primary_key: str,
         namespace: Optional[str] = None,
@@ -187,18 +224,33 @@ class Store(ABC):
         """
         namespace = await self._ensure_namespace_exists(namespace)
 
-        if await self._check_primary_keys([primary_key], namespace):
+        if await self._check_primary_keys(
+            primary_keys=[primary_key], namespace=namespace
+        ):
             return await self._update_existing_pkey(
-                namespace, primary_key, value, labels
+                namespace=namespace,
+                primary_key=primary_key,
+                value=value,
+                guid=guid,
+                labels=labels,
             )
         else:
             if throw_on_not_found:
                 raise NotFoundException("primary key did not exist")
-            return await self._insert_given_pkey(namespace, primary_key, value, labels)
+            else:
+                return await self._insert_given_pkey(
+                    namespace=namespace,
+                    primary_key=primary_key,
+                    value=value,
+                    guid=guid,
+                    labels=labels,
+                )
 
     async def put_by_labels(
         self,
+        *,
         value: ValueDict,
+        guid: str,
         labels: Labels,
         namespace: Optional[str] = None,
     ) -> str:
@@ -219,17 +271,25 @@ class Store(ABC):
         namespace = await self._ensure_namespace_exists(namespace)
 
         existing_key = self._ensure_single_or_no_match(
-            await self._find_primary_keys_by_labels(namespace, labels)
+            await self._find_primary_keys_by_labels(
+                namespace=namespace, guid=guid, labels=labels
+            )
         )
         if existing_key:
             return await self._update_existing_pkey(
-                namespace, existing_key, value, labels
+                namespace=namespace,
+                primary_key=existing_key,
+                value=value,
+                guid=guid,
+                labels=labels,
             )
         else:
-            return await self._insert_new_pkey(namespace, value, labels)
+            return await self._insert_new_pkey(
+                namespace=namespace, value=value, guid=guid, labels=labels
+            )
 
     async def get_by_primary_key(
-        self, primary_key: str, namespace: Optional[str] = None
+        self, *, primary_key: str, namespace: Optional[str] = None
     ) -> SearchResult:
         """
         Retrieve a value by its primary key from the specified namespace.
@@ -246,14 +306,16 @@ class Store(ABC):
         """
         namespace = await self._get_namespace(namespace)
 
-        result = await self._get_values_of_primary_keys(namespace, [primary_key])
+        result = await self._get_values_of_primary_keys(
+            namespace=namespace, primary_keys=[primary_key]
+        )
         return {
             "primary_key": primary_key,
             **result[primary_key],
         }
 
     async def get_by_labels(
-        self, labels: Labels, namespace: Optional[str] = None
+        self, *, guid: str, labels: Labels, namespace: Optional[str] = None
     ) -> SearchResult:
         """
         Retrieve a value by its labels from the specified namespace.
@@ -272,17 +334,25 @@ class Store(ABC):
         namespace = await self._get_namespace(namespace)
 
         primary_key = self._ensure_single_match(
-            await self._find_primary_keys_by_labels(namespace, labels)
+            await self._find_primary_keys_by_labels(
+                namespace=namespace, guid=guid, labels=labels
+            )
         )
 
-        result = await self._get_values_of_primary_keys(namespace, [primary_key])
+        result = await self._get_values_of_primary_keys(
+            namespace=namespace, primary_keys=[primary_key]
+        )
         return {
             "primary_key": primary_key,
             **result[primary_key],
         }
 
     async def search(
-        self, partial_labels: Labels, namespace: Optional[str] = None
+        self,
+        *,
+        guid: Optional[str],
+        partial_labels: Labels,
+        namespace: Optional[str] = None,
     ) -> List[SearchResult]:
         """
         Search for values that match the partial labels in the specified namespace.
@@ -297,14 +367,18 @@ class Store(ABC):
         namespace = await self._get_namespace(namespace)
 
         primary_keys = await self._find_primary_keys_by_labels(
-            namespace, partial_labels
+            namespace=namespace, guid=guid, labels=partial_labels
         )
 
         # do this check to guarantee that the primary keys exist for the _get_values_of_primary_keys call
-        if not await self._check_primary_keys(primary_keys, namespace):
+        if not await self._check_primary_keys(
+            primary_keys=primary_keys, namespace=namespace
+        ):
             raise ConflictException("Something is messed up")
 
-        values = await self._get_values_of_primary_keys(namespace, primary_keys)
+        values = await self._get_values_of_primary_keys(
+            namespace=namespace, primary_keys=primary_keys
+        )
 
         return [
             {
@@ -315,7 +389,7 @@ class Store(ABC):
         ]
 
     async def delete_by_primary_key(
-        self, primary_key: str, namespace: Optional[str] = None
+        self, *, primary_key: str, namespace: Optional[str] = None
     ) -> None:
         """
         Delete a value by its primary key from the specified namespace.
@@ -329,7 +403,9 @@ class Store(ABC):
         """
         namespace = await self._get_namespace(namespace)
 
-        if not await self._check_primary_keys([primary_key], namespace):
+        if not await self._check_primary_keys(
+            primary_keys=[primary_key], namespace=namespace
+        ):
             return None
         else:
-            await self._delete(primary_key, namespace)
+            await self._delete(primary_key=primary_key, namespace=namespace)

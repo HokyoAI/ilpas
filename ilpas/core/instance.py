@@ -1,33 +1,24 @@
 from copy import deepcopy
-from typing import Dict, Generic, Literal, Optional, Type, TypeVar, cast, overload
+from typing import Dict, Generic, Literal, Optional, TypeVar, cast, overload
 
 from pydantic import BaseModel, ValidationError, create_model
 from pydantic.fields import FieldInfo
 from pydantic.types import JsonValue
 
+from .integration import Integration
+from .models.base_model_extras import (
+    DEFAULT_SENSITIVE,
+    DEFAULT_SUPPLIER,
+    DEFAULT_TRIGGER_CALLBACK,
+)
 from .models.errors import BadDataError, IlpasValueError
-from .models.types import ConfigurationState, ConfigurationSupplier
+from .models.types import ConfigurationSupplier, InstanceState
 from .store import Labels, Store
-
-DEFAULT_SUPPLIER: ConfigurationSupplier = "user"
-DEFAULT_SENSITIVE: bool = False
-
-
-class NoConfig(BaseModel):
-    model_config = {"extra": "forbid"}
-
-
-def extras(
-    supplier: ConfigurationSupplier = DEFAULT_SUPPLIER,
-    sensitive: bool = DEFAULT_SENSITIVE,
-) -> Dict[str, JsonValue]:
-    return {"supplier": supplier, "sensitive": sensitive}
-
 
 _T = TypeVar("_T", bound=BaseModel)
 
 
-class InstanceManager(Generic[_T]):
+class Instance(Generic[_T]):
 
     def _is_field_required(self, field_info: FieldInfo) -> bool:
         """Check if a field is required based on its FieldInfo"""
@@ -69,132 +60,11 @@ class InstanceManager(Generic[_T]):
         else:
             return cast(ConfigurationSupplier, supplier_string)
 
-    @overload
-    def __init__(
-        self,
-        config_class: Type[_T],
-        guid: str,
-        *,
-        namespace: Optional[str],
-        primary_key: str,
-        labels: None = None,
-        temporary: Literal[False] = False,
-    ) -> None: ...
-
-    @overload
-    def __init__(
-        self,
-        config_class: Type[_T],
-        guid: str,
-        *,
-        namespace: Optional[str],
-        primary_key: None = None,
-        labels: Labels,
-        temporary: Literal[False] = False,
-    ) -> None: ...
-
-    @overload
-    def __init__(
-        self,
-        config_class: Type[_T],
-        guid: str,
-        *,
-        namespace: None = None,
-        primary_key: None = None,
-        labels: None = None,
-        temporary: Literal[True] = True,
-    ) -> None: ...
-
-    def __init__(
-        self,
-        config_class: Type[_T],
-        guid: str,
-        *,
-        namespace: Optional[str] = None,
-        primary_key: Optional[str] = None,
-        labels: Optional[Labels] = None,
-        temporary: bool = False,
-    ):
-        self.config_class = config_class
-        self.guid: str = guid
-        self.namespace: Optional[str] = namespace
-        self.primary_key = primary_key
-        self.labels = labels
-        self.temporary = temporary
-        if primary_key is None and labels is None and not temporary:
-            raise IlpasValueError(
-                "must provide either primary_key or labels, or set temporary=True"
-            )
-        self._config_data: Dict[str, JsonValue] = {}
-        self._state: ConfigurationState = "pending"
-
-    @staticmethod
-    def _add_guid_to_labels_copy(guid: str, labels: Labels):
-        result = deepcopy(labels)
-        result["guid"] = guid
-        return result
-
-    @staticmethod
-    def _remove_guid_from_labels_copy(labels: Labels):
-        result = deepcopy(labels)
-        if "guid" not in result:
-            raise BadDataError("Expected to find guid in labels but did not")
-        result.pop("guid")
-        return result
-
-    @classmethod
-    async def restore_by_primary_key(
-        cls,
-        store: Store,
-        config_class: type[_T],
-        guid: str,
-        primary_key: str,
-        namespace: Optional[str],
-    ) -> "InstanceManager":
-        """Restore the configuration from the store"""
-        data = await store.get_by_primary_key(primary_key, namespace)
-        all_labels = data["labels"]
-        original_labels = cls._remove_guid_from_labels_copy(
-            all_labels
-        )  # guid should be stored in the labels
-        value = data["value"]
-        result = cls(
-            config_class,
-            guid=guid,
-            primary_key=primary_key,
-            namespace=namespace,
+    def _is_field_callback_trigger(self, field_info: FieldInfo) -> bool:
+        """Check if a field triggers a callback based on its FieldInfo"""
+        return self._get_extra_field(
+            field_info, "triggers_callback", bool, DEFAULT_TRIGGER_CALLBACK
         )
-        result.labels = original_labels
-        for supplier, config in value.items():
-            result.add_configuration(supplier, config)
-        return result
-
-    @classmethod
-    async def restore_by_labels(
-        cls,
-        store: Store,
-        config_class: type[_T],
-        guid: str,
-        labels: Labels,
-        namespace: Optional[str],
-    ) -> "InstanceManager":
-        """Restore the configuration from the store"""
-        all_labels = cls._add_guid_to_labels_copy(
-            guid, labels
-        )  # guid should be stored in the labels
-        data = await store.get_by_labels(all_labels, namespace)
-        value = data["value"]
-        primary_key = data["primary_key"]
-        result = cls(
-            config_class,
-            guid=guid,
-            labels=labels,
-            namespace=namespace,
-        )
-        result.primary_key = primary_key
-        for supplier, config in value.items():
-            result.add_configuration(supplier, config)
-        return result
 
     def get_model(self, supplier: ConfigurationSupplier) -> type[BaseModel]:
         """Generate a Pydantic model for fields from a specific source"""
@@ -218,6 +88,7 @@ class InstanceManager(Generic[_T]):
         return self.get_model(supplier=supplier).model_json_schema()
 
     def serialize_config(self, supplier: ConfigurationSupplier) -> Dict[str, JsonValue]:
+        """TODO take into account sensitive fields"""
         supplier_model = self.get_model(supplier)
         supplier_data = {
             field_name: self._config_data[field_name]
@@ -233,15 +104,121 @@ class InstanceManager(Generic[_T]):
         except ValidationError as e:
             return None
 
+    @overload
+    def __init__(
+        self,
+        integration: Integration,
+        *,
+        namespace: Optional[str],
+        primary_key: str,
+        labels: None = None,
+        temporary: Literal[False] = False,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        integration: Integration,
+        *,
+        namespace: Optional[str],
+        primary_key: None = None,
+        labels: Labels,
+        temporary: Literal[False] = False,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        integration: Integration,
+        *,
+        namespace: None = None,
+        primary_key: None = None,
+        labels: None = None,
+        temporary: Literal[True] = True,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        integration: Integration[_T],
+        *,
+        namespace: Optional[str] = None,
+        primary_key: Optional[str] = None,
+        labels: Optional[Labels] = None,
+        temporary: bool = False,
+    ):
+        self.integration = integration
+        self.config_class = integration.final_config_model
+        self.guid: str = integration.spec.guid
+        self.namespace: Optional[str] = namespace
+        self.primary_key = primary_key
+        self.labels = labels
+        self.temporary = temporary
+        if primary_key is None and labels is None and not temporary:
+            raise IlpasValueError(
+                "must provide either primary_key or labels, or set temporary=True"
+            )
+        self._config_data: Dict[str, JsonValue] = {}
+        self._state: InstanceState = "pending"
+        admin_model = self.get_model("admin")
+        admin_model(**integration.supplied_config)  # validate admin supplied config
+        self.add_configuration("admin", self.integration.supplied_config)
+
+    @classmethod
+    async def restore_by_primary_key(
+        cls,
+        store: Store,
+        integration: Integration,
+        primary_key: str,
+        namespace: Optional[str],
+    ) -> "Instance":
+        """Restore the configuration from the store"""
+        data = await store.get_by_primary_key(
+            primary_key=primary_key, namespace=namespace
+        )
+        labels = data["labels"]
+        value = data["value"]
+        result = cls(
+            integration,
+            primary_key=primary_key,
+            namespace=namespace,
+        )
+        result.labels = labels
+        for supplier, config in value.items():
+            result.add_configuration(supplier, config)
+        return result
+
+    @classmethod
+    async def restore_by_labels(
+        cls,
+        store: Store,
+        integration: Integration,
+        labels: Labels,
+        namespace: Optional[str],
+    ) -> "Instance":
+        """Restore the configuration from the store"""
+        guid = integration.spec.guid
+        data = await store.get_by_labels(guid=guid, labels=labels, namespace=namespace)
+        value = data["value"]
+        primary_key = data["primary_key"]
+        result = cls(
+            integration,
+            labels=labels,
+            namespace=namespace,
+        )
+        result.primary_key = primary_key
+        for supplier, config in value.items():
+            result.add_configuration(supplier, config)
+        return result
+
     def _update_state(self) -> None:
-        """Update the configuration state based on requirements and provided data"""
+        """
+        Update the configuration state based on current data.
+        """
 
         model = self.build_model()
 
         if model is not None:
-            self._state = "complete"
-        elif len(self._config_data) > 0:
-            self._state = "partial"
+            self._state = "healthy"
         else:
             self._state = "pending"
 
@@ -256,4 +233,8 @@ class InstanceManager(Generic[_T]):
     async def _persist_state_by_primary_key(
         self, store: Store, primary_key: str, namespace: Optional[str]
     ):
+        pass
+
+    async def delete(self, store: Store):
+        """TODO"""
         pass

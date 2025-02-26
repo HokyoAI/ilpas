@@ -4,7 +4,7 @@ from pydantic.types import JsonValue
 
 type ConfigurationSupplier = Literal["admin", "user", "callback"]
 
-type ConfigurationState = Literal["pending", "partial", "complete"]
+type InstanceState = Literal["pending", "healthy", "unhealthy"]
 
 # Type variables for generic typing
 type LabelValue = Union[str, int, float, bool, None]
@@ -15,6 +15,7 @@ type ValueDict = Dict[ConfigurationSupplier, Dict[str, JsonValue]]
 class ValueAndLabels(TypedDict):
     value: ValueDict
     labels: Labels
+    guid: str
 
 
 class SearchResult(ValueAndLabels):

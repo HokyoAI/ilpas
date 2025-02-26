@@ -176,8 +176,8 @@ class Catalog:
 
         return get_integration_config
 
-    def _build_upsert_integration_config_handler(self):
-        async def upsert_integration_config(
+    def _build_put_integration_config_handler(self):
+        async def put_integration_config(
             manager: Annotated[InstanceManager, Depends(self._load_manager_dep)],
             config: Annotated[Dict[str, JsonValue], Body(embed=True)],
         ):
@@ -185,9 +185,22 @@ class Catalog:
                 manager.get_model("user")(**config)
             except ValidationError as e:
                 raise RequestValidationError(e.errors())
-            print("hello")
+            manager.add_configuration("user", config)
+            # need some way to save the config to store
 
-        return upsert_integration_config
+        return put_integration_config
+
+    def _build_integration_config_callback_handler(self):
+        async def integration_config_callback(
+            guid: Annotated[str, Depends(self._validate_guid_dep)],
+            config: Annotated[Dict[str, JsonValue], Body(embed=True)],
+        ):
+            integration = self._integration_registry[guid]
+            try:
+                integration.config_callback(config)
+            except ValidationError as e:
+                raise RequestValidationError(e.errors())
+            # need some way to save the config to store
 
     def _build_connect_router(self) -> APIRouter:
         base_router = APIRouter(
@@ -206,10 +219,9 @@ class Catalog:
 
         management_router = APIRouter(dependencies=[Depends(self._load_manager_dep)])
         get_integration_config_handler = self._build_get_integration_config_handler()
-        upsert_integration_config_handler = (
-            self._build_upsert_integration_config_handler()
-        )
-        management_router.post("/")(upsert_integration_config_handler)
+        put_integration_config_handler = self._build_put_integration_config_handler()
+
+        management_router.put("/")(put_integration_config_handler)
         management_router.get("/")(get_integration_config_handler)
 
         base_router.include_router(schema_router)

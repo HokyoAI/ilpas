@@ -3,8 +3,11 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 
 from ilpas.core.catalog import Catalog
-from ilpas.core.integration import Callback, Display, Integration, Specification
-from ilpas.core.instance import InstanceManager, extras
+from ilpas.core.instance import Instance, Labels
+from ilpas.core.integration import Integration, Specification
+from ilpas.core.models.callback import Callback
+from ilpas.core.models.display import Display
+from ilpas.dx.helpers import extras
 from ilpas.dx.in_memory_store import InMemoryStore
 
 
@@ -28,6 +31,7 @@ Slack = Specification(
     ),
     config_model=SlackIntegrationConfig,
     callback=None,
+    health_check=None,
     endpoints={},
     webhooks={},
 )
@@ -40,7 +44,8 @@ SlackV2 = Specification(
         logo_url="https://slack.com/favicon.ico",
     ),
     config_model=SlackIntegrationConfig,
-    callback=Callback()
+    callback=Callback(),
+    health_check=None,
     endpoints={},
     webhooks={},
 )
@@ -80,24 +85,26 @@ slack_v2 = Integration(
 )
 
 
-# app = FastAPI()
+app = FastAPI()
 
 
-# async def authenticate(blah: int):
-#     import random
+async def authenticate(blah: int):
+    import random
 
-#     if random.randint(0, 1) == 0:
-#         return None
-#     return "placeholder_ns", tuple(str(blah))
+    if random.randint(0, 1) == 0:
+        return None
+
+    labels: Labels = {"blah": blah}
+    return "placeholder_ns", labels
 
 
-# catalog = Catalog(authenticate=authenticate, store=InMemoryStore())
+catalog = Catalog(authenticate=authenticate, store=InMemoryStore())
 
-# catalog.add_integration(slack)
-# catalog.add_integration(slack_v2)
-# catalog.finalize()
+catalog.add_integration(slack)
+catalog.add_integration(slack_v2)
+catalog.finalize()
 
-# router = catalog.router()
-# app.include_router(router)
+router = catalog.router()
+app.include_router(router)
 
-# uvicorn.run(app, host="0.0.0.0", port=8000)
+uvicorn.run(app, host="0.0.0.0", port=8000)

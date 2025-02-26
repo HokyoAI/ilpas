@@ -1,8 +1,7 @@
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from typing import Dict, Iterable, List, Optional, Set
 
-from .models.errors import BadDataError, ConflictException, NotFoundException
+from .models.errors import ConflictException, NotFoundException
 from .models.types import Labels, SearchResult, ValueAndLabels, ValueDict
 
 
@@ -186,20 +185,6 @@ class Store(ABC):
             return None
         else:
             return primary_keys.pop()
-
-    # @staticmethod
-    # def _add_guid_to_labels_copy(*, guid: str, labels: Labels):
-    #     result = deepcopy(labels)
-    #     result["guid"] = guid
-    #     return result
-
-    # @staticmethod
-    # def _remove_guid_from_labels_copy(labels: Labels):
-    #     result = deepcopy(labels)
-    #     if "guid" not in result:
-    #         raise BadDataError("Expected to find guid in labels but did not")
-    #     result.pop("guid")
-    #     return result
 
     async def put_by_primary_key(
         self,

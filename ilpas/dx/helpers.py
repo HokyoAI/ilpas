@@ -7,7 +7,7 @@ from ..core.models.base_model_extras import (
     DEFAULT_SUPPLIER,
     DEFAULT_TRIGGER_CALLBACK,
 )
-from ..core.models.types import ConfigurationSupplier, JsonValue
+from ..core.models.types import ConfigurationSupplier, JsonValue, Sensitivity
 
 
 class NoConfig(BaseModel):
@@ -16,7 +16,7 @@ class NoConfig(BaseModel):
 
 def extras(
     supplier: ConfigurationSupplier = DEFAULT_SUPPLIER,
-    sensitive: bool = DEFAULT_SENSITIVE,
+    sensitivity: Sensitivity = DEFAULT_SENSITIVE,
     triggers_callback: bool = DEFAULT_TRIGGER_CALLBACK,
 ) -> Dict[str, JsonValue]:
     if triggers_callback:
@@ -26,6 +26,6 @@ def extras(
             )
     return {
         "supplier": supplier,
-        "sensitive": sensitive,
+        "sensitive": sensitivity,
         "triggers_callback": triggers_callback,
     }

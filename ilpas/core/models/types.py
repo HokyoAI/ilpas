@@ -3,7 +3,7 @@ from typing import Dict, Literal, TypedDict, Union
 from pydantic.types import JsonValue
 
 type ConfigurationSupplier = Literal["admin", "user", "callback"]
-
+type Sensitivity = Literal["none", "low", "high"]
 type InstanceState = Literal["pending", "healthy", "unhealthy"]
 
 # Type variables for generic typing

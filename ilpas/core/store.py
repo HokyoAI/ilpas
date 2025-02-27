@@ -394,3 +394,43 @@ class Store(ABC):
             return None
         else:
             await self._delete(primary_key=primary_key, namespace=namespace)
+
+    @abstractmethod
+    async def put_instance_discovery(
+        self, *, key: str, primary_key: str, namespace: Optional[str]
+    ) -> None:
+        """
+        Store a public instance discovery key for a given primary key and namespace.
+        The discovery key is stored in the default namespace.
+
+        Args:
+            key: The public instance discovery key
+            primary_key: The primary key of the instance
+            namespace: Optional namespace of the instance (default is used if not provided)
+        """
+        pass
+
+    @abstractmethod
+    async def instance_discovery(
+        self, *, key: str
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """
+        Retrieve the primary key and namespace of an instance by a public discovery key.
+
+        Args:
+            key: The public instance discovery key
+
+        Returns:
+            The primary key of the instance, and the namespace if available
+        """
+        pass
+
+    @abstractmethod
+    async def delete_instance_discovery(self, *, key: str) -> None:
+        """
+        Delete a public instance discovery key.
+
+        Args:
+            key: The public instance discovery key
+        """
+        pass

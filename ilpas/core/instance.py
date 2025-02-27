@@ -1,9 +1,7 @@
-from copy import deepcopy
 from typing import Dict, Generic, Literal, Optional, TypeVar, cast, overload
 
 from pydantic import BaseModel, ValidationError, create_model
 from pydantic.fields import FieldInfo
-from pydantic.types import JsonValue
 
 from .integration import Integration
 from .models.base_model_extras import (
@@ -12,7 +10,7 @@ from .models.base_model_extras import (
     DEFAULT_TRIGGER_CALLBACK,
 )
 from .models.errors import BadDataError, IlpasValueError
-from .models.types import ConfigurationSupplier, InstanceState
+from .models.types import ConfigurationSupplier, InstanceState, JsonValue, Sensitivity
 from .store import Labels, Store
 
 _T = TypeVar("_T", bound=BaseModel)
@@ -46,9 +44,15 @@ class Instance(Generic[_T]):
                 f"field {field_info.title} json_schema_extra must be a dict, callable is not supported"
             )
 
-    def _is_field_sensitive(self, field_info: FieldInfo) -> bool:
+    def _get_field_sensitivity(self, field_info: FieldInfo) -> Sensitivity:
         """Check if a field is sensitive based on its FieldInfo"""
-        return self._get_extra_field(field_info, "sensitive", bool, DEFAULT_SENSITIVE)
+        sens_string = self._get_extra_field(
+            field_info, "sensitive", str, DEFAULT_SENSITIVE
+        )
+        if sens_string not in ["none", "low", "high"]:
+            raise ValueError(f"Invalid sensitivity {sens_string}")
+        else:
+            return cast(Sensitivity, sens_string)
 
     def _get_field_supplier(self, field_info: FieldInfo) -> ConfigurationSupplier:
         """Get the supplier for a field based on its FieldInfo"""
@@ -86,16 +90,6 @@ class Instance(Generic[_T]):
         """Generate JSON schema for fields from a specific source"""
 
         return self.get_model(supplier=supplier).model_json_schema()
-
-    def serialize_config(self, supplier: ConfigurationSupplier) -> Dict[str, JsonValue]:
-        """TODO take into account sensitive fields"""
-        supplier_model = self.get_model(supplier)
-        supplier_data = {
-            field_name: self._config_data[field_name]
-            for field_name in supplier_model.__pydantic_fields__.keys()
-            if field_name in self._config_data
-        }
-        return supplier_data
 
     def build_model(self) -> Optional[_T]:
         """Try to build the final configuration model"""
@@ -166,6 +160,7 @@ class Instance(Generic[_T]):
     @classmethod
     async def restore_by_primary_key(
         cls,
+        *,
         store: Store,
         integration: Integration,
         primary_key: str,
@@ -190,6 +185,7 @@ class Instance(Generic[_T]):
     @classmethod
     async def restore_by_labels(
         cls,
+        *,
         store: Store,
         integration: Integration,
         labels: Labels,
@@ -209,6 +205,28 @@ class Instance(Generic[_T]):
         for supplier, config in value.items():
             result.add_configuration(supplier, config)
         return result
+
+    @classmethod
+    async def restore_by_discovery_key(
+        cls,
+        *,
+        store: Store,
+        integration: Integration,
+        key_type: Literal["callback", "webhook"],
+        key: str,
+    ):
+        full_key = f"{integration.spec.guid}:{key_type}:{key}"
+        instance_ids = await store.instance_discovery(key=full_key)
+        if not instance_ids:
+            raise BadDataError("No instances found")
+        primary_key = instance_ids[0]
+        namespace = instance_ids[1]
+        return await cls.restore_by_primary_key(
+            store=store,
+            integration=integration,
+            primary_key=primary_key,
+            namespace=namespace,
+        )
 
     def _update_state(self) -> None:
         """
@@ -230,10 +248,47 @@ class Instance(Generic[_T]):
         self._config_data.update(config_data)
         self._update_state()
 
-    async def _persist_state_by_primary_key(
-        self, store: Store, primary_key: str, namespace: Optional[str]
-    ):
-        pass
+    def serialize_config(
+        self, supplier: ConfigurationSupplier, redact: bool = True
+    ) -> Dict[str, JsonValue]:
+        supplier_model = self.get_model(supplier)
+        supplier_data = {}
+        for field_name, field_info in supplier_model.__pydantic_fields__.items():
+            sensitivity = self._get_field_sensitivity(field_info)
+            if redact and sensitivity == "high":
+                continue
+            if field_name in self._config_data:
+                supplier_data[field_name] = self._config_data[field_name]
+
+        return supplier_data
+
+    async def save(self, store: Store):
+        if self.temporary:
+            raise IlpasValueError("Cannot save temporary instance")
+        user_config = self.serialize_config("user", redact=False)
+        callback_config = self.serialize_config("callback", redact=False)
+        # admin config is not saved to the store, it is always resupplied through code
+        value: Dict[ConfigurationSupplier, Dict[str, JsonValue]] = {
+            "user": user_config,
+            "callback": callback_config,
+        }
+        if self.primary_key is not None:
+            await store.put_by_primary_key(
+                value=value,
+                guid=self.guid,
+                labels=self.labels if self.labels is not None else {},
+                namespace=self.namespace,
+                primary_key=self.primary_key,
+            )
+        elif self.labels is not None:
+            await store.put_by_labels(
+                value=value,
+                guid=self.guid,
+                labels=self.labels,
+                namespace=self.namespace,
+            )
+        else:
+            raise IlpasValueError("Instance must have primary_key or labels")
 
     async def delete(self, store: Store):
         """TODO"""

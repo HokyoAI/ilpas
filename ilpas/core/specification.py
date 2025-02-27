@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import Dict, Generic, Optional, TypeVar
+from typing import Awaitable, Callable, Dict, Generic, Optional, TypeVar
 
+from fastapi import Request
 from pydantic import BaseModel
 
 from .models.callback import Callback
@@ -16,7 +17,7 @@ class Specification(Generic[_T]):
     guid: str
     display: Display
     config_model: type[_T]
-    callback: Optional[Callback]
-    health_check: Optional[Endpoint]
     endpoints: Dict[str, Endpoint]
-    webhooks: Dict[str, Webhook]
+    health_check: Optional[Endpoint]
+    callback: Optional[Callback]
+    webhook: Optional[Webhook]

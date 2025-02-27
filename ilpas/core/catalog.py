@@ -3,13 +3,13 @@ import warnings
 from enum import StrEnum
 from typing import Annotated, Awaitable, Callable, Dict
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
-from pydantic.types import JsonValue
 
 from .instance import Instance
 from .integration import Integration
+from .models.types import JsonValue
 from .store import Labels, Store
 
 logger = logging.getLogger(__name__)
@@ -116,7 +116,12 @@ class Catalog:
     def _build_get_catalog_info_handler(self):
         async def get_catalog_handler():
             return [
-                self._integration_registry[guid].spec.display
+                {
+                    "guid": guid,
+                    "display": self._integration_registry[
+                        guid
+                    ].spec.display.model_dump(),
+                }
                 for guid in self._integration_registry
             ]
 
@@ -182,7 +187,8 @@ class Catalog:
             except ValidationError as e:
                 raise RequestValidationError(e.errors())
             instance.add_configuration("user", config)
-            # need some way to save the config to store
+            await instance.save(self._store)
+            # either return success or needs to do a callback now
 
         return put_integration_user_config
 
@@ -205,8 +211,56 @@ class Catalog:
                     status_code=404, detail="This integration does not accept callbacks"
                 )
             params = request.query_params
+            query_dict = dict(params.items())
+            callback_config = await integration.spec.callback.process(query_dict)
+            callback_key = await integration.spec.callback.key(query_dict)
+            instance = await Instance.restore_by_discovery_key(
+                store=self._store,
+                integration=integration,
+                key_type="callback",
+                key=callback_key,
+            )
+            instance.add_configuration("callback", callback_config)
+            await instance.save(self._store)
+            # needs to redirect now
 
         return integration_config_callback
+
+    def _build_webhook_handler(self):
+        async def webhook_handler(
+            request: Request, guid: Annotated[str, Depends(self._validate_guid_dep)]
+        ):
+            integration = self._integration_registry[guid]
+            if not integration.spec.webhook:
+                raise HTTPException(
+                    status_code=404, detail="This integration does not accept webhooks"
+                )
+            if not await integration.spec.webhook.verify(
+                request, integration.supplied_config
+            ):
+                raise HTTPException(status_code=403, detail="Invalid webhook")
+            discovery_key = await integration.spec.webhook.identify(
+                request, integration.supplied_config
+            )
+            # instance = None
+            # if discovery_key:
+            #     instance = await Instance.restore_by_discovery_key(
+            #         store=self._store,
+            #         integration=integration,
+            #         key_type="webhook",
+            #         key=discovery_key,
+            #     )
+            # do this in event handling to avoid loading instance and respond quicker
+            event = await integration.spec.webhook.router(
+                request, integration.supplied_config
+            )
+            # still need to publish event for handling
+            if event.respond:
+                return await event.respond(request)
+            else:
+                return Response(status_code=200)  # quick and decisive OK response
+
+        return webhook_handler
 
     def _build_connect_router(self) -> APIRouter:
         base_router = APIRouter(
@@ -232,28 +286,27 @@ class Catalog:
         management_router.get("/")(get_integration_user_config_handler)
         management_router.put("/")(put_integration_user_config_handler)
 
+        """callback and webhook routers need different ways to load instance"""
         callback_router = APIRouter()
         integration_callback_handler = self._build_integration_config_callback_handler()
         callback_router.get("/callback")(integration_callback_handler)
 
+        webhook_router = APIRouter(tags=["webhook"])
+        webhook_router.post("/webhooks")(self._build_webhook_handler())
+
         base_router.include_router(management_router)
         base_router.include_router(callback_router)
+        base_router.include_router(webhook_router)
         return base_router
-
-    def _build_webhook_router(self) -> APIRouter:
-
-        router = APIRouter(prefix="/webhook", tags=["webhook"])
-        return router
 
     def _build_admin_router(self) -> APIRouter:
         router = APIRouter(prefix="/admin", tags=["admin"])
-        return router
+        raise NotImplementedError("Admin routes are not yet implemented")
 
     def router(
         self,
         info: bool = True,
         connect: bool = True,
-        webhook: bool = True,
         admin: bool = False,
     ) -> APIRouter:
         if not self.finalized:
@@ -263,8 +316,6 @@ class Catalog:
             catalog_router.include_router(self._build_info_router())
         if connect:
             catalog_router.include_router(self._build_connect_router())
-        if webhook:
-            catalog_router.include_router(self._build_webhook_router())
         if admin:
             logger.warning(
                 "Admin routes are enabled. Ensure this router is properly secured."

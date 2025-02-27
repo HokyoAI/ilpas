@@ -18,7 +18,7 @@ class SlackIntegrationConfig(BaseModel):
     api_key: str = Field(
         ...,
         description="Slack API token",
-        json_schema_extra=extras("admin", sensitive=True),
+        json_schema_extra=extras("admin", sensitivity="high"),
     )
 
 

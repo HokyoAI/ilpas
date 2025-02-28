@@ -192,10 +192,8 @@ class Instance(Generic[_T]):
         namespace: Optional[str],
     ) -> "Instance":
         """Restore the configuration from the store"""
-        print(store.store)
         guid = integration.spec.guid
         data = await store.get_by_labels(guid=guid, labels=labels, namespace=namespace)
-        print(data)
         value = data["value"]
         primary_key = data["primary_key"]
         result = cls(

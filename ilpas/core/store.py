@@ -173,7 +173,7 @@ class Store(ABC):
         elif len(primary_keys) == 0:
             raise NotFoundException(f"No record found matching the provided labels")
         else:
-            return primary_keys.pop()
+            return next(iter(primary_keys))
 
     def _ensure_single_or_no_match(self, primary_keys: Set[str]) -> Optional[str]:
         """Ensure there is at most one match, raising an exception if there are multiple."""
@@ -184,7 +184,7 @@ class Store(ABC):
         elif len(primary_keys) == 0:
             return None
         else:
-            return primary_keys.pop()
+            return next(iter(primary_keys))
 
     async def put_by_primary_key(
         self,

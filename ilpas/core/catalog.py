@@ -128,10 +128,11 @@ class Catalog:
         ):
             """Load an instance from the store. If not found, raise an error."""
             try:
+
                 instance = await self._load_instance_helper(guid, identity)
+                return instance
             except NotFoundException:
                 raise HTTPException(status_code=404, detail="Instance not found")
-            return instance
 
         return require_instance
 
@@ -306,7 +307,6 @@ class Catalog:
         management_router = APIRouter(
             dependencies=[
                 Depends(self._require_authentication_dep),
-                Depends(self._load_instance_dep),
             ]
         )
         get_integration_user_config_handler = (

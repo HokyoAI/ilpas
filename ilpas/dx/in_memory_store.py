@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Dict, Iterable, Optional, Set
 from uuid import uuid4
 
@@ -89,6 +90,7 @@ class InMemoryStore(Store):
         Returns:
             A set of primary keys matching the labels
         """
+
         matching_primary_keys: Set[str] | None = None
         if not labels and guid is None:
             return set(self.store[namespace].keys())
@@ -115,7 +117,7 @@ class InMemoryStore(Store):
 
         if matching_primary_keys is None:
             return set()
-        return matching_primary_keys
+        return deepcopy(matching_primary_keys)
 
     async def _get_values_of_primary_keys(
         self, *, namespace: str, primary_keys: Iterable[str]
@@ -133,7 +135,7 @@ class InMemoryStore(Store):
         result = {}
         for pkey in primary_keys:
             result[pkey] = self.store[namespace][pkey]
-        return result
+        return deepcopy(result)
 
     async def _check_primary_keys(
         self, *, primary_keys: Iterable[str], namespace: str
@@ -326,7 +328,7 @@ class InMemoryStore(Store):
         Returns:
             The primary key of the instance, and the namespace if available
         """
-        return self.instance_discovery_store.get(key, None)
+        return deepcopy(self.instance_discovery_store.get(key, None))
 
     async def delete_instance_discovery(self, *, key: str) -> None:
         """

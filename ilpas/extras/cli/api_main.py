@@ -98,11 +98,6 @@ app.add_middleware(
 
 
 async def authenticate():
-    import random
-
-    # if random.randint(0, 1) == 0:
-    #     return None
-
     labels: Labels = {}
     return "placeholder_ns", labels
 

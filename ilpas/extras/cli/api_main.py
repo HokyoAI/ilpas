@@ -115,5 +115,3 @@ catalog.finalize()
 
 router = catalog.router()
 app.include_router(router)
-
-# uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from .instance import Instance
 from .integration import Integration
+from .models.errors import NotFoundException
 from .models.types import JsonValue
 from .store import Labels, Store
 
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 class Catalog:
     """
     Catalog of integrations.
+
+    All paths are prefixed with /catalog and should end with a trailing slash.
 
     IMPORTANT: Claude caught this one.
     See https://stackoverflow.com/questions/78110125/how-to-dynamically-create-fastapi-routes-handlers-for-a-list-of-pydantic-models
@@ -43,7 +46,7 @@ class Catalog:
         if integration.spec.guid in self._integration_registry:
             raise ValueError(f"Integration {integration.spec.guid} already exists")
         Instance(
-            integration
+            integration, temporary=True
         )  # this is a temporary instance to validate the supplied config
         self._integration_registry[integration.spec.guid] = integration
 
@@ -64,6 +67,7 @@ class Catalog:
         )
         self._validate_guid_dep = self._build_validate_guid_dependency()
         self._load_instance_dep = self._build_load_instance_dependency()
+        self._require_instance_dep = self._build_require_instance_dependency()
         self._temp_instance_dep = self._build_temp_instance_dependency()
 
     def _build_require_authentication_dependency(self):
@@ -85,6 +89,16 @@ class Catalog:
 
         return validate_guid
 
+    async def _load_instance_helper(self, guid: str, identity: tuple[str, Labels]):
+        integration = self._integration_registry[guid]
+        instance = await Instance.restore_by_labels(
+            store=self._store,
+            integration=integration,
+            namespace=identity[0],
+            labels=identity[1],
+        )  # will raise NotFoundException if not found
+        return instance
+
     def _build_load_instance_dependency(self):
 
         async def load_instance(
@@ -93,23 +107,39 @@ class Catalog:
                 tuple[str, Labels], Depends(self._require_authentication_dep)
             ],
         ):
-            integration = self._integration_registry[guid]
-            instance = await Instance.restore_by_labels(
-                store=self._store,
-                integration=integration,
-                labels=identity[1],
-                namespace=identity[0],
-            )
-            instance.add_configuration("admin", integration.supplied_config)
+            """Load an instance from the store. If not found, create a new instance."""
+            try:
+                instance = await self._load_instance_helper(guid, identity)
+            except NotFoundException:
+                integration = self._integration_registry[guid]
+                instance = Instance(
+                    integration, namespace=identity[0], labels=identity[1]
+                )
             return instance
 
         return load_instance
+
+    def _build_require_instance_dependency(self):
+        async def require_instance(
+            guid: Annotated[str, Depends(self._validate_guid_dep)],
+            identity: Annotated[
+                tuple[str, Labels], Depends(self._require_authentication_dep)
+            ],
+        ):
+            """Load an instance from the store. If not found, raise an error."""
+            try:
+                instance = await self._load_instance_helper(guid, identity)
+            except NotFoundException:
+                raise HTTPException(status_code=404, detail="Instance not found")
+            return instance
+
+        return require_instance
 
     def _build_temp_instance_dependency(self):
 
         async def temp_instance(guid: Annotated[str, Depends(self._validate_guid_dep)]):
             integration = self._integration_registry[guid]
-            return Instance(integration)
+            return Instance(integration, temporary=True)
 
         return temp_instance
 
@@ -162,16 +192,18 @@ class Catalog:
         )
         get_integration_info_handler = self._build_get_integration_info_handler()
         get_integration_schema_handler = self._build_get_integration_schema_handler()
-        info_router.get("/info")(get_catalog_info_handler)
-        info_router.get("/enabled")(get_enabled_integrations_handler)
-        info_router.get("/{guid}/info")(get_integration_info_handler)
-        info_router.get("/{guid}/schema")(get_integration_schema_handler)
+        info_router.get("/info/")(get_catalog_info_handler)
+        info_router.get("/enabled/")(get_enabled_integrations_handler)
+        info_router.get("/{guid}/info/")(get_integration_info_handler)
+        info_router.get("/{guid}/schema/")(get_integration_schema_handler)
 
         return info_router
 
     def _build_get_integration_user_config_handler(self):
         async def get_integration_user_config(
-            instance: Annotated[Instance, Depends(self._load_instance_dep)],
+            instance: Annotated[
+                Instance, Depends(self._require_instance_dep)
+            ],  # will throw 404 if not found
         ):
             return instance.serialize_config("user")
 
@@ -194,7 +226,7 @@ class Catalog:
 
     def _build_delete_integration_instance_handler(self):
         async def delete_integration_instance(
-            instance: Annotated[Instance, Depends(self._load_instance_dep)]
+            instance: Annotated[Instance, Depends(self._require_instance_dep)]
         ):
             await instance.delete(self._store)
 
@@ -289,10 +321,10 @@ class Catalog:
         """callback and webhook routers need different ways to load instance"""
         callback_router = APIRouter()
         integration_callback_handler = self._build_integration_config_callback_handler()
-        callback_router.get("/callback")(integration_callback_handler)
+        callback_router.get("/callback/")(integration_callback_handler)
 
         webhook_router = APIRouter(tags=["webhook"])
-        webhook_router.post("/webhooks")(self._build_webhook_handler())
+        webhook_router.post("/webhooks/")(self._build_webhook_handler())
 
         base_router.include_router(management_router)
         base_router.include_router(callback_router)

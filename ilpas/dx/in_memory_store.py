@@ -66,6 +66,8 @@ class InMemoryStore(Store):
         # }
         self.guid_index: Dict[str, Dict[str, Set[str]]] = {}
 
+        self.instance_discovery_store: Dict[str, tuple[str, Optional[str]]] = {}
+
     async def _check_namespace(self, namespace):
         return namespace in self.store
 
@@ -297,3 +299,40 @@ class InMemoryStore(Store):
             namespace=namespace, primary_key=primary_key, guid=guid, labels=labels
         )
         return primary_key
+
+    async def put_instance_discovery(
+        self, *, key: str, primary_key: str, namespace: Optional[str]
+    ) -> None:
+        """
+        Store a public instance discovery key for a given primary key and namespace.
+        The discovery key is stored in the default namespace.
+
+        Args:
+            key: The public instance discovery key
+            primary_key: The primary key of the instance
+            namespace: Optional namespace of the instance (default is used if not provided)
+        """
+        self.instance_discovery_store[key] = (primary_key, namespace)
+
+    async def instance_discovery(
+        self, *, key: str
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """
+        Retrieve the primary key and namespace of an instance by a public discovery key.
+
+        Args:
+            key: The public instance discovery key
+
+        Returns:
+            The primary key of the instance, and the namespace if available
+        """
+        return self.instance_discovery_store.get(key, None)
+
+    async def delete_instance_discovery(self, *, key: str) -> None:
+        """
+        Delete a public instance discovery key.
+
+        Args:
+            key: The public instance discovery key
+        """
+        self.instance_discovery_store.pop(key, None)

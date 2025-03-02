@@ -1,19 +1,13 @@
 from dataclasses import dataclass
-from typing import Dict, Generic, Optional, TypeVar
+from typing import Dict, Generic, TypeVar
 
-from pydantic import BaseModel
-
-from .models.types import JsonValue
+from .models.types import AM, JsonValue
 from .specification import Specification
 
-_T = TypeVar("_T", bound=BaseModel)
+_A = TypeVar("_A", bound=AM)
 
 
 @dataclass
-class Integration(Generic[_T]):
-    spec: Specification[_T]
-    final_config_model: type[_T]
-    supplied_config: Dict[str, JsonValue]
-
-    async def reset_callbacks(self) -> None:
-        pass
+class Integration(Generic[_A]):
+    spec: type[Specification[_A, AM, AM, AM, AM]]
+    supplied_config: _A

@@ -66,14 +66,14 @@ class CustomSlackConfig(SlackIntegrationConfig):
 slack = Integration(
     spec=Slack,
     final_config_model=CustomSlackConfig,
-    supplied_config={"api_key": "xoxb-123456789012-123456789012-123456789012"},
+    supplied_config={},
 )
 
 
 class CustomSlackConfigV2(SlackIntegrationConfig):
     """Admin's extended Slack configuration"""
 
-    default_channel: str = Field(..., json_schema_extra=extras("user"))
+    default_channel: str = Field(..., json_schema_extra=extras("user"), min_length=1)
     refresh_token: str = Field(
         default="foo", json_schema_extra=extras("callback", sensitivity="high")
     )

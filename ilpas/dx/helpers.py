@@ -10,10 +10,6 @@ from ..core.models.base_model_extras import (
 from ..core.models.types import ConfigurationSupplier, JsonValue, Sensitivity
 
 
-class NoConfig(BaseModel):
-    model_config = {"extra": "forbid"}
-
-
 def extras(
     supplier: ConfigurationSupplier = DEFAULT_SUPPLIER,
     sensitivity: Sensitivity = DEFAULT_SENSITIVE,

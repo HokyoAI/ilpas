@@ -1,5 +1,6 @@
-from typing import Dict, Literal, TypedDict, Union
+from typing import Dict, Literal, Optional, TypedDict, Union
 
+from pydantic import BaseModel
 from pydantic.types import JsonValue
 
 type ConfigurationSupplier = Literal["admin", "user", "callback"]
@@ -20,3 +21,8 @@ class ValueAndLabels(TypedDict):
 
 class SearchResult(ValueAndLabels):
     primary_key: str
+
+
+type KeyTypes = Literal["callback", "webhook"]
+
+type AM = BaseModel

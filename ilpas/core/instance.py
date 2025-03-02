@@ -10,7 +10,13 @@ from .models.base_model_extras import (
     DEFAULT_TRIGGER_CALLBACK,
 )
 from .models.errors import BadDataError, IlpasValueError
-from .models.types import ConfigurationSupplier, InstanceState, JsonValue, Sensitivity
+from .models.types import (
+    ConfigurationSupplier,
+    InstanceState,
+    JsonValue,
+    KeyTypes,
+    Sensitivity,
+)
 from .store import Labels, Store
 
 _T = TypeVar("_T", bound=BaseModel)
@@ -153,9 +159,10 @@ class Instance(Generic[_T]):
             )
         self._config_data: Dict[str, JsonValue] = {}
         self._state: InstanceState = "pending"
-        admin_model = self.get_model("admin")
-        admin_model(**integration.supplied_config)  # validate admin supplied config
-        self.add_configuration("admin", self.integration.supplied_config)
+        if not temporary:
+            admin_model = self.get_model("admin")
+            admin_model(**integration.supplied_config)  # validate admin supplied config
+            self.add_configuration("admin", self.integration.supplied_config)
 
     @classmethod
     async def restore_by_primary_key(
@@ -206,16 +213,44 @@ class Instance(Generic[_T]):
             result.add_configuration(supplier, config)
         return result
 
+    @staticmethod
+    def _full_key_helper(*, guid: str, key_type: KeyTypes, key: str) -> str:
+        return f"{guid}:{key_type}:{key}"
+
+    async def create_discovery_key(
+        self,
+        *,
+        store: Store,
+        key_type: KeyTypes,
+        key: str,
+    ):
+        full_key = self._full_key_helper(
+            guid=self.guid,
+            key_type=key_type,
+            key=key,
+        )
+        if self.primary_key is None:
+            raise IlpasValueError(
+                "Instance must have primary_key to create discovery key"
+            )
+        await store.put_instance_discovery(
+            key=full_key, primary_key=self.primary_key, namespace=self.namespace
+        )
+
     @classmethod
     async def restore_by_discovery_key(
         cls,
         *,
         store: Store,
         integration: Integration,
-        key_type: Literal["callback", "webhook"],
+        key_type: KeyTypes,
         key: str,
     ):
-        full_key = f"{integration.spec.guid}:{key_type}:{key}"
+        full_key = cls._full_key_helper(
+            guid=integration.spec.guid,
+            key_type=key_type,
+            key=key,
+        )
         instance_ids = await store.instance_discovery(key=full_key)
         if not instance_ids:
             raise BadDataError("No instances found")
@@ -228,10 +263,14 @@ class Instance(Generic[_T]):
             namespace=namespace,
         )
 
-    def _update_state(self) -> None:
+    def _update_state(self, pending_callback: bool = False) -> None:
         """
         Update the configuration state based on current data.
         """
+
+        if pending_callback:
+            self._state = "pending"
+            return
 
         model = self.build_model()
 
@@ -242,11 +281,23 @@ class Instance(Generic[_T]):
 
     def add_configuration(
         self, supplier: ConfigurationSupplier, config_data: Dict[str, JsonValue]
-    ):
+    ) -> bool:
+        if self.temporary:
+            raise IlpasValueError("Cannot add configuration to temporary instance")
         model = self.get_model(supplier)
         model(**config_data)
+        trigger_callback = False
+        if supplier == "user":
+            for field_name, field_info in model.__pydantic_fields__.items():
+                if (
+                    self._is_field_callback_trigger(field_info)
+                    and field_name in config_data
+                ):
+                    if self._config_data.get(field_name) != config_data[field_name]:
+                        trigger_callback = True
         self._config_data.update(config_data)
-        self._update_state()
+        self._update_state(pending_callback=trigger_callback)
+        return trigger_callback
 
     def serialize_config(
         self, supplier: ConfigurationSupplier, redact: bool = True
@@ -291,5 +342,11 @@ class Instance(Generic[_T]):
             raise IlpasValueError("Instance must have primary_key or labels")
 
     async def delete(self, store: Store):
-        """TODO"""
-        pass
+        if self.temporary:
+            raise IlpasValueError("Cannot delete temporary instance")
+        if self.primary_key is not None:
+            await store.delete_by_primary_key(
+                primary_key=self.primary_key, namespace=self.namespace
+            )
+        else:
+            raise IlpasValueError("Instance must have primary_key to be deleted")

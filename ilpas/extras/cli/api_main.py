@@ -23,6 +23,13 @@ class SlackIntegrationConfig(BaseModel):
     )
 
 
+async def slack_uri(data: dict):
+    return "https://slack.com/oauth/v2/authorize?client_id={client_id}&scope={scopes}&redirect_uri={redirect_uri}"
+
+
+slack_callback = Callback()
+
+
 Slack = Specification(
     guid="slack_latest",
     display=Display(
@@ -56,7 +63,9 @@ SlackV2 = Specification(
 class CustomSlackConfig(SlackIntegrationConfig):
     """Admin's extended Slack configuration"""
 
-    default_channel: str = Field(..., json_schema_extra=extras("user"))
+    default_channel: str = Field(
+        ..., json_schema_extra=extras("user"), min_length=1
+    )  # IMPORTANT: min_length=1, might write a helper function to apply this to all required strings
     notification_prefix: str = Field(
         default="[ALERT]", json_schema_extra=extras("user")
     )
@@ -74,6 +83,7 @@ class CustomSlackConfigV2(SlackIntegrationConfig):
     """Admin's extended Slack configuration"""
 
     default_channel: str = Field(..., json_schema_extra=extras("user"))
+    scopes: str = Field(..., json_schema_extra=extras("user", triggers_callback=True))
     refresh_token: str = Field(
         default="foo", json_schema_extra=extras("callback", sensitivity="high")
     )

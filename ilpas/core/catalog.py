@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import warnings
 from enum import StrEnum
@@ -9,7 +10,8 @@ from pydantic import ValidationError
 
 from .instance import Instance
 from .integration import Integration
-from .models.errors import NotFoundException
+from .models.errors import IlpasValueError, NotFoundException
+from .models.put_response import PutResponse, RedirectNotRequired, RedirectRequired
 from .models.types import JsonValue
 from .store import Labels, Store
 
@@ -45,9 +47,11 @@ class Catalog:
             raise RuntimeError("Catalog is finalized, cannot add more integrations")
         if integration.spec.guid in self._integration_registry:
             raise ValueError(f"Integration {integration.spec.guid} already exists")
-        Instance(
+        temp_instance = Instance(
             integration, temporary=True
         )  # this is a temporary instance to validate the supplied config
+        admin_model = temp_instance.get_model("admin")
+        admin_model(**integration.supplied_config)
         self._integration_registry[integration.spec.guid] = integration
 
     def finalize(self):
@@ -214,14 +218,31 @@ class Catalog:
         async def put_integration_user_config(
             instance: Annotated[Instance, Depends(self._load_instance_dep)],
             config: Annotated[Dict[str, JsonValue], Body(embed=True)],
-        ):
+        ) -> PutResponse:
             try:
                 instance.get_model("user")(**config)
             except ValidationError as e:
                 raise RequestValidationError(e.errors())
-            instance.add_configuration("user", config)
+            trigger_callback = instance.add_configuration("user", config)
             await instance.save(self._store)
-            # either return success or needs to do a callback now
+            if trigger_callback:
+                callback = instance.integration.spec.callback
+                if not callback:
+                    raise IlpasValueError(
+                        "Configuration cannot trigger a callback if the spec does not have a callback"
+                    )
+                uri, key = await asyncio.gather(
+                    *[callback.uri(config), callback.key(config)]
+                )
+                await instance.create_discovery_key(
+                    store=self._store, key_type="callback", key=key
+                )
+                return RedirectRequired(
+                    config=instance.serialize_config("user"),
+                    redirect_uri=uri,
+                )
+            else:
+                return RedirectNotRequired(config=instance.serialize_config("user"))
 
         return put_integration_user_config
 
@@ -315,8 +336,14 @@ class Catalog:
         put_integration_user_config_handler = (
             self._build_put_integration_user_config_handler()
         )
+        delete_integration_instance_handler = (
+            self._build_delete_integration_instance_handler()
+        )
         management_router.get("/")(get_integration_user_config_handler)
-        management_router.put("/")(put_integration_user_config_handler)
+        management_router.put("/", response_model=PutResponse)(
+            put_integration_user_config_handler
+        )
+        management_router.delete("/")(delete_integration_instance_handler)
 
         """callback and webhook routers need different ways to load instance"""
         callback_router = APIRouter()

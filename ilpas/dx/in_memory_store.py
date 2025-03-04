@@ -1,9 +1,15 @@
 from copy import deepcopy
-from typing import Dict, Iterable, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 from uuid import uuid4
 
-from ..core.models.errors import BadDataError
-from ..core.models.types import Labels, LabelValue, ValueAndLabels, ValueDict
+from ..core.models.errors import BadDataError, IlpasValueError
+from ..core.models.types import (
+    Labels,
+    LabelValue,
+    StoreModel,
+    ValueAndLabels,
+    ValueDict,
+)
 from ..core.store import Store
 
 
@@ -12,20 +18,29 @@ class InMemoryStore(Store):
     In-memory implementation of the Store interface.
     """
 
-    def __init__(self, default_namespace: str = "default"):
+    def __init__(
+        self,
+        primary_encryption_key: str,
+        secondary_encryption_keys: List[str] | None,
+        default_namespace: str = "default",
+    ):
         """
         Initialize an in-memory store.
 
         Args:
             default_namespace: The default namespace to use when none is specified
         """
-        super().__init__(default_namespace)
+        super().__init__(
+            primary_encryption_key=primary_encryption_key,
+            secondary_encryption_keys=secondary_encryption_keys,
+            default_namespace=default_namespace,
+        )
 
         # Store structure:
         # {
         #   namespace1: {
         #     primary_key1: {
-        #       "value": value1,
+        #       "encrypted_value": <bytes>,
         #       "labels": {label1: value1, ...},
         #       "guid": guid1
         #     },
@@ -37,7 +52,7 @@ class InMemoryStore(Store):
             str,
             Dict[
                 str,
-                ValueAndLabels,
+                StoreModel,
             ],
         ] = {}
 
@@ -117,11 +132,13 @@ class InMemoryStore(Store):
 
         if matching_primary_keys is None:
             return set()
-        return deepcopy(matching_primary_keys)
+        return deepcopy(
+            matching_primary_keys
+        )  # deepcopy in case the set is modified later
 
-    async def _get_values_of_primary_keys(
+    async def _get_encrypted_values_of_primary_keys(
         self, *, namespace: str, primary_keys: Iterable[str]
-    ) -> Dict[str, ValueAndLabels]:
+    ) -> Dict[str, StoreModel]:
         """
         Retrieve the values of primary keys from the specified namespace.
 
@@ -132,7 +149,7 @@ class InMemoryStore(Store):
         Returns:
             A dictionary mapping primary keys to their values and labels
         """
-        result = {}
+        result: Dict[str, StoreModel] = {}
         for pkey in primary_keys:
             result[pkey] = self.store[namespace][pkey]
         return deepcopy(result)
@@ -240,45 +257,39 @@ class InMemoryStore(Store):
         *,
         namespace: str,
         primary_key: str,
-        value: ValueDict,
-        guid: str,
-        labels: Labels,
+        store_model: StoreModel,
     ) -> str:
         """Set the value and labels for an existing primary key in the specified namespace."""
         current_labels = self.store[namespace][primary_key]["labels"]
         current_guid = self.store[namespace][primary_key]["guid"]
-        if current_guid != guid:
+        if current_guid != store_model["guid"]:
             raise BadDataError("GUID cannot be updated")
         self._deindex_labels(
             namespace=namespace,
             primary_key=primary_key,
-            guid=guid,
+            guid=store_model["guid"],
             labels=current_labels,
         )
-        self.store[namespace][primary_key] = {
-            "value": value,
-            "labels": labels,
-            "guid": guid,
-        }
+        self.store[namespace][primary_key] = store_model
         self._index_labels(
-            namespace=namespace, primary_key=primary_key, guid=guid, labels=labels
+            namespace=namespace,
+            primary_key=primary_key,
+            guid=store_model["guid"],
+            labels=store_model["labels"],
         )
         return primary_key
 
-    async def _insert_new_pkey(
-        self, *, namespace: str, value: ValueDict, guid: str, labels: Labels
-    ) -> str:
+    async def _insert_new_pkey(self, *, namespace: str, store_model: StoreModel) -> str:
         """Set the value and labels for a new primary key in the specified namespace."""
         pkey = str(uuid4())
         if await self._check_primary_keys(primary_keys=[pkey], namespace=namespace):
             raise RuntimeError("UUID collision")
-        self.store[namespace][pkey] = {
-            "value": value,
-            "labels": labels,
-            "guid": guid,
-        }
+        self.store[namespace][pkey] = store_model
         self._index_labels(
-            namespace=namespace, primary_key=pkey, guid=guid, labels=labels
+            namespace=namespace,
+            primary_key=pkey,
+            guid=store_model["guid"],
+            labels=store_model["labels"],
         )
         return pkey
 
@@ -287,18 +298,19 @@ class InMemoryStore(Store):
         *,
         namespace: str,
         primary_key: str,
-        value: ValueDict,
-        guid: str,
-        labels: Labels,
+        store_model: StoreModel,
     ) -> str:
         """Insert a new primary key with the given value and labels."""
-        self.store[namespace][primary_key] = {
-            "value": value,
-            "labels": labels,
-            "guid": guid,
-        }
+        if await self._check_primary_keys(
+            primary_keys=[primary_key], namespace=namespace
+        ):
+            raise IlpasValueError("Primary key already exists")
+        self.store[namespace][primary_key] = store_model
         self._index_labels(
-            namespace=namespace, primary_key=primary_key, guid=guid, labels=labels
+            namespace=namespace,
+            primary_key=primary_key,
+            guid=store_model["guid"],
+            labels=store_model["labels"],
         )
         return primary_key
 

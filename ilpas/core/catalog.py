@@ -1,18 +1,24 @@
 import asyncio
 import logging
-import warnings
 from enum import StrEnum
-from typing import Annotated, Awaitable, Callable, Dict
+from typing import Annotated, Awaitable, Callable, Dict, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
+from hatchet_sdk import Hatchet
 from pydantic import ValidationError
 
+from .httpx import HttpxAsyncClient
+from .hub import Event, HatchetListener, Hub, Listener
 from .instance import Instance
 from .integration import Integration
+from .models.config_response import (
+    ConfigResponse,
+    RedirectNotRequired,
+    RedirectRequired,
+)
 from .models.errors import IlpasValueError, NotFoundException
-from .models.put_response import PutResponse, RedirectNotRequired, RedirectRequired
-from .models.types import JsonValue
+from .models.types import AM, JsonValue
 from .store import Labels, Store
 
 logger = logging.getLogger(__name__)
@@ -22,44 +28,68 @@ class Catalog:
     """
     Catalog of integrations.
 
-    All paths are prefixed with /catalog and should end with a trailing slash.
+    All api paths are prefixed with /catalog and should end with a trailing slash (Except for webhooks, special case).
 
     IMPORTANT: Claude caught this one.
     See https://stackoverflow.com/questions/78110125/how-to-dynamically-create-fastapi-routes-handlers-for-a-list-of-pydantic-models
-    Helper functions must be used to create routes handlers for each integration because of scoping and closure issues.
+    Helper functions must be used to create routes handlers for legacy method of creating routes for each integration
+    because of scoping and closure issues.
     """
 
     def __init__(
         self,
+        *,
         store: Store,
-        authenticate: Callable[..., Awaitable[tuple[str, Labels] | None]],
+        hatchet: Hatchet,
+        additional_listeners: List[Listener] = [],
     ):
         self.finalized: bool = False
         self._store = store
-        self._authenticate = authenticate
-        self._integration_registry: Dict[str, Integration] = {}
+        self._hub = Hub()
+        self._hub.register(HatchetListener(hatchet))
+        for listener in additional_listeners:
+            self._hub.register(listener)
+        self._integration_registry: Dict[str, Integration[AM, AM, AM, AM]] = {}
 
-    def add_integration(
-        self,
-        integration: Integration,
-    ):
+    def add_integration(self, *, integration: Integration[AM, AM, AM, AM]):
         if self.finalized:
             raise RuntimeError("Catalog is finalized, cannot add more integrations")
         if integration.spec.guid in self._integration_registry:
             raise ValueError(f"Integration {integration.spec.guid} already exists")
-        temp_instance = Instance(
-            integration, temporary=True
-        )  # this is a temporary instance to validate the supplied config
-        admin_model = temp_instance.get_model("admin")
-        admin_model(**integration.supplied_config)
+
         self._integration_registry[integration.spec.guid] = integration
 
     def finalize(self):
         if self.finalized:
             raise RuntimeError("Catalog is already finalized")
         self.finalized = True
-        self._create_enabled_integrations_enum()  # order matters!
+
+    def router(
+        self,
+        *,
+        http_authenticate: Callable[..., Awaitable[tuple[str, Labels] | None]],
+        include_info: bool = True,
+        include_connect: bool = True,
+    ) -> APIRouter:
+        if not self.finalized:
+            raise RuntimeError("Catalog is not finalized, cannot create router")
+
+        # order matters !
+        self._http_authenticate = http_authenticate
+        self._create_enabled_integrations_enum()
         self._create_dependency_functions()
+
+        catalog_router = APIRouter(prefix="/catalog", tags=["catalog"])
+        if include_info:
+            catalog_router.include_router(self._build_info_router())
+        if include_connect:
+            catalog_router.include_router(self._build_connect_router())
+
+        return catalog_router
+
+    def worker(self):
+        if not self.finalized:
+            raise RuntimeError("Catalog is not finalized, cannot create worker")
 
     def _create_enabled_integrations_enum(self):
         members = {key.upper(): key for key in self._integration_registry.keys()}
@@ -70,14 +100,15 @@ class Catalog:
             self._build_require_authentication_dependency()
         )
         self._validate_guid_dep = self._build_validate_guid_dependency()
-        self._load_instance_dep = self._build_load_instance_dependency()
+        self._try_load_instance_dep = self._build_try_load_instance_dependency()
         self._require_instance_dep = self._build_require_instance_dependency()
-        self._temp_instance_dep = self._build_temp_instance_dependency()
 
     def _build_require_authentication_dependency(self):
 
         async def require_authentication(
-            identity: Annotated[tuple[str, Labels] | None, Depends(self._authenticate)]
+            identity: Annotated[
+                tuple[str, Labels] | None, Depends(self._http_authenticate)
+            ]
         ):
             if identity is None:
                 raise HTTPException(status_code=401, detail="Not authenticated")
@@ -93,60 +124,39 @@ class Catalog:
 
         return validate_guid
 
-    async def _load_instance_helper(self, guid: str, identity: tuple[str, Labels]):
-        integration = self._integration_registry[guid]
-        instance = await Instance.restore_by_labels(
-            store=self._store,
-            integration=integration,
-            namespace=identity[0],
-            labels=identity[1],
-        )  # will raise NotFoundException if not found
-        return instance
+    def _build_try_load_instance_dependency(self):
 
-    def _build_load_instance_dependency(self):
-
-        async def load_instance(
+        async def try_load_instance(
             guid: Annotated[str, Depends(self._validate_guid_dep)],
             identity: Annotated[
                 tuple[str, Labels], Depends(self._require_authentication_dep)
             ],
-        ):
-            """Load an instance from the store. If not found, create a new instance."""
+        ) -> Instance | None:
+            """Load an instance from the store. If not found, return None"""
             try:
-                instance = await self._load_instance_helper(guid, identity)
-            except NotFoundException:
                 integration = self._integration_registry[guid]
-                instance = Instance(
-                    integration, namespace=identity[0], labels=identity[1]
-                )
-            return instance
+                instance = await Instance.restore_by_labels(
+                    store=self._store,
+                    integration=integration,
+                    namespace=identity[0],
+                    labels=identity[1],
+                )  # will raise NotFoundException if not found
+                return instance
+            except NotFoundException:
+                return None
 
-        return load_instance
+        return try_load_instance
 
     def _build_require_instance_dependency(self):
         async def require_instance(
-            guid: Annotated[str, Depends(self._validate_guid_dep)],
-            identity: Annotated[
-                tuple[str, Labels], Depends(self._require_authentication_dep)
-            ],
-        ):
+            instance: Annotated[Instance | None, Depends(self._try_load_instance_dep)],
+        ) -> Instance:
             """Load an instance from the store. If not found, raise an error."""
-            try:
-
-                instance = await self._load_instance_helper(guid, identity)
-                return instance
-            except NotFoundException:
+            if instance is None:
                 raise HTTPException(status_code=404, detail="Instance not found")
+            return instance
 
         return require_instance
-
-    def _build_temp_instance_dependency(self):
-
-        async def temp_instance(guid: Annotated[str, Depends(self._validate_guid_dep)]):
-            integration = self._integration_registry[guid]
-            return Instance(integration, temporary=True)
-
-        return temp_instance
 
     def _build_get_catalog_info_handler(self):
         async def get_catalog_handler():
@@ -182,9 +192,11 @@ class Catalog:
         """
 
         async def get_integration_schema(
-            temp_instance: Annotated[Instance, Depends(self._temp_instance_dep)],
+            guid: Annotated[str, Depends(self._validate_guid_dep)],
         ):
-            return temp_instance.get_json_schema("user")
+            return self._integration_registry[
+                guid
+            ].spec.user_config_model.model_json_schema()
 
         return get_integration_schema
 
@@ -204,21 +216,70 @@ class Catalog:
 
         return info_router
 
-    def _build_get_integration_user_config_handler(self):
-        async def get_integration_user_config(
+    def _build_get_instance_handler(self):
+        async def get_instance(
             instance: Annotated[
                 Instance, Depends(self._require_instance_dep)
             ],  # will throw 404 if not found
         ):
-            return instance.serialize_config("user")
+            return instance.serialize_config_by_supplier("user")
 
-        return get_integration_user_config
+        return get_instance
 
-    def _build_put_integration_user_config_handler(self):
-        async def put_integration_user_config(
-            instance: Annotated[Instance, Depends(self._load_instance_dep)],
+    def _build_create_instance_handler(self):
+        async def create_instance(
+            guid: Annotated[str, Depends(self._validate_guid_dep)],
+            identity: Annotated[
+                tuple[str, Labels], Depends(self._require_authentication_dep)
+            ],
+            instance: Annotated[Instance | None, Depends(self._try_load_instance_dep)],
             config: Annotated[Dict[str, JsonValue], Body(embed=True)],
-        ) -> PutResponse:
+        ) -> ConfigResponse:
+            if instance is not None:
+                raise HTTPException(status_code=409, detail="Instance already exists")
+            integration = self._integration_registry[guid]
+            instance = Instance(
+                integration=integration,
+                store=self._store,
+                supplied_user_config=config,
+                namespace=identity[0],
+                labels=identity[1],
+            )
+
+            await instance.save()
+            if not instance.primary_key:
+                raise HTTPException(
+                    status_code=500, detail="Instance was not saved correctly"
+                )
+
+            if integration.spec.callback:
+                state_key = await instance.assign_discovery_key(
+                    key_type="callback", key=None, one_time=True
+                )
+                uri = await integration.spec.callback.uri(
+                    user_config=instance.user_config,
+                    admin_config=instance.admin_config,
+                    state_key=state_key,
+                )
+                return RedirectRequired(
+                    config=instance.serialize_config_by_supplier("user"),
+                    redirect_uri=uri,
+                )
+
+            else:
+                if integration.spec.setup:
+                    pass  # push setup event
+                return RedirectNotRequired(
+                    config=instance.serialize_config_by_supplier("user")
+                )
+
+        return create_instance
+
+    def _build_update_instance_handler(self):
+        async def update_instance(
+            instance: Annotated[Instance, Depends(self._require_instance_dep)],
+            config: Annotated[Dict[str, JsonValue], Body(embed=True)],
+        ) -> ConfigResponse:
             try:
                 instance.get_model("user")(**config)
             except ValidationError as e:
@@ -244,18 +305,18 @@ class Catalog:
             else:
                 return RedirectNotRequired(config=instance.serialize_config("user"))
 
-        return put_integration_user_config
+        return update_instance
 
-    def _build_delete_integration_instance_handler(self):
-        async def delete_integration_instance(
+    def _build_delete_instance_handler(self):
+        async def delete_instance(
             instance: Annotated[Instance, Depends(self._require_instance_dep)]
         ):
-            await instance.delete(self._store)
+            await instance.delete()
 
-        return delete_integration_instance
+        return delete_instance
 
-    def _build_integration_config_callback_handler(self):
-        async def integration_config_callback(
+    def _build_callback_handler(self):
+        async def callback(
             guid: Annotated[str, Depends(self._validate_guid_dep)],
             request: Request,
         ):
@@ -264,21 +325,31 @@ class Catalog:
                 raise HTTPException(
                     status_code=404, detail="This integration does not accept callbacks"
                 )
-            params = request.query_params
-            query_dict = dict(params.items())
-            callback_config = await integration.spec.callback.process(query_dict)
-            callback_key = await integration.spec.callback.key(query_dict)
+            query_dict = dict(request.query_params.items())
+            state_key = await integration.spec.callback.identify(
+                query_params=query_dict
+            )
             instance = await Instance.restore_by_discovery_key(
                 store=self._store,
                 integration=integration,
                 key_type="callback",
-                key=callback_key,
+                key=state_key,
             )
-            instance.add_configuration("callback", callback_config)
-            await instance.save(self._store)
-            # needs to redirect now
+            callback_config = await integration.spec.callback.process(
+                query_params=query_dict,
+                user_config=instance.user_config,
+                admin_config=instance.admin_config,
+            )
+            instance.callback_config = callback_config
 
-        return integration_config_callback
+            return await integration.spec.callback.respond(
+                query_params=query_dict,
+                user_config=instance.user_config,
+                admin_config=instance.admin_config,
+                callback_config=callback_config,
+            )
+
+        return callback
 
     def _build_webhook_handler(self):
         async def webhook_handler(
@@ -330,57 +401,29 @@ class Catalog:
                 Depends(self._require_authentication_dep),
             ]
         )
-        get_integration_user_config_handler = (
-            self._build_get_integration_user_config_handler()
+        get_instance_handler = self._build_get_instance_handler()
+        create_instance_handler = self._build_create_instance_handler()
+        update_instance_handler = self._build_update_instance_handler()
+        delete_instance_handler = self._build_delete_instance_handler()
+        management_router.get("/")(get_instance_handler)
+        management_router.post("/", response_model=ConfigResponse)(
+            create_instance_handler
         )
-        put_integration_user_config_handler = (
-            self._build_put_integration_user_config_handler()
+        management_router.put("/", response_model=ConfigResponse)(
+            update_instance_handler
         )
-        delete_integration_instance_handler = (
-            self._build_delete_integration_instance_handler()
-        )
-        management_router.get("/")(get_integration_user_config_handler)
-        management_router.put("/", response_model=PutResponse)(
-            put_integration_user_config_handler
-        )
-        management_router.delete("/")(delete_integration_instance_handler)
+        management_router.delete("/")(delete_instance_handler)
 
         """callback and webhook routers need different ways to load instance"""
         callback_router = APIRouter()
-        integration_callback_handler = self._build_integration_config_callback_handler()
-        callback_router.get("/callback/")(integration_callback_handler)
+        callback_handler = self._build_callback_handler()
+        callback_router.get("/callback/")(callback_handler)
 
         webhook_router = APIRouter(tags=["webhook"])
-        webhook_router.post("/webhooks/")(self._build_webhook_handler())
+        webhook_handler = self._build_webhook_handler()
+        webhook_router.post("/webhooks{rest_of_path:path}")(webhook_handler)
 
         base_router.include_router(management_router)
         base_router.include_router(callback_router)
         base_router.include_router(webhook_router)
         return base_router
-
-    def _build_admin_router(self) -> APIRouter:
-        router = APIRouter(prefix="/admin", tags=["admin"])
-        raise NotImplementedError("Admin routes are not yet implemented")
-
-    def router(
-        self,
-        info: bool = True,
-        connect: bool = True,
-        admin: bool = False,
-    ) -> APIRouter:
-        if not self.finalized:
-            raise RuntimeError("Catalog is not finalized, cannot create router")
-        catalog_router = APIRouter(prefix="/catalog", tags=["catalog"])
-        if info:
-            catalog_router.include_router(self._build_info_router())
-        if connect:
-            catalog_router.include_router(self._build_connect_router())
-        if admin:
-            logger.warning(
-                "Admin routes are enabled. Ensure this router is properly secured."
-            )
-            warnings.warn(
-                "Admin routes are enabled. Ensure this router is properly secured."
-            )
-            catalog_router.include_router(self._build_admin_router())
-        return catalog_router

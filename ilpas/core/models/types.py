@@ -1,9 +1,9 @@
-from typing import Dict, Literal, Optional, TypedDict, Union
+from typing import Dict, Literal, NotRequired, Optional, TypedDict, Union
 
 from pydantic import BaseModel
 from pydantic.types import JsonValue
 
-type ConfigurationSupplier = Literal["admin", "user", "callback"]
+type ConfigurationSupplier = Literal["admin", "user", "callback", "state"]
 type Sensitivity = Literal["none", "low", "high"]
 type InstanceState = Literal["pending", "healthy", "unhealthy"]
 
@@ -13,8 +13,25 @@ type Labels = Dict[str, LabelValue]
 type ValueDict = Dict[ConfigurationSupplier, Dict[str, JsonValue]]
 
 
+class HashDict(TypedDict):
+    hash: str
+
+
+class HashedValueDict(TypedDict):
+    admin: HashDict
+    user: Dict[str, JsonValue]
+    callback: NotRequired[Dict[str, JsonValue]]
+    state: NotRequired[Dict[str, JsonValue]]
+
+
+class StoreModel(TypedDict):
+    encrypted_value: bytes
+    labels: Labels
+    guid: str
+
+
 class ValueAndLabels(TypedDict):
-    value: ValueDict
+    value: HashedValueDict
     labels: Labels
     guid: str
 

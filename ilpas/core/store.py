@@ -1,8 +1,20 @@
+import base64
+import json
 from abc import ABC, abstractmethod
+from hashlib import sha256
 from typing import Dict, Iterable, List, Optional, Set
 
+from cryptography.fernet import Fernet, MultiFernet
+
 from .models.errors import ConflictException, NotFoundException
-from .models.types import Labels, SearchResult, ValueAndLabels, ValueDict
+from .models.types import (
+    HashedValueDict,
+    Labels,
+    SearchResult,
+    StoreModel,
+    ValueAndLabels,
+    ValueDict,
+)
 
 
 class Store(ABC):
@@ -15,7 +27,26 @@ class Store(ABC):
     3. Searchable labels for flexible querying
     """
 
-    def __init__(self, default_namespace: str = "default") -> None:
+    def __init__(
+        self,
+        *,
+        primary_encryption_key: str,  # should be 32 byte base64 encoded string
+        secondary_encryption_keys: Optional[List[str]],
+        default_namespace: str = "default",
+    ) -> None:
+        """
+        encryption keys should be 32 byte base64 encoded strings
+        can generate with openssl rand -base64 32
+        """
+        if secondary_encryption_keys is None:
+            additional_keys: List[str] = []
+        else:
+            additional_keys = secondary_encryption_keys
+        encryption_keys = [primary_encryption_key] + additional_keys
+        formatted_keys = [
+            base64.urlsafe_b64encode(base64.b64decode(key)) for key in encryption_keys
+        ]
+        self.encryptor = MultiFernet([Fernet(key) for key in formatted_keys])
         self.default_namespace = default_namespace
 
     @abstractmethod
@@ -44,18 +75,18 @@ class Store(ABC):
         pass
 
     @abstractmethod
-    async def _get_values_of_primary_keys(
+    async def _get_encrypted_values_of_primary_keys(
         self, *, namespace: str, primary_keys: Iterable[str]
-    ) -> Dict[str, ValueAndLabels]:
+    ) -> Dict[str, StoreModel]:
         """
-        Retrieve the values of primary keys from the specified namespace.
+        Retrieve the encrypted values of primary keys from the specified namespace.
 
         Args:
             namespace: The namespace to search in
             primary_keys: The primary keys to retrieve
 
         Returns:
-            A dictionary mapping primary keys to their values and labels
+            A dictionary of primary keys to encrypted values and labels
         """
         pass
 
@@ -88,23 +119,14 @@ class Store(ABC):
         self,
         *,
         namespace: str,
-        guid: str,
         primary_key: str,
-        value: ValueDict,
-        labels: Labels,
+        store_model: StoreModel,
     ) -> str:
         """Set the value and labels for an existing primary key in the specified namespace."""
         pass
 
     @abstractmethod
-    async def _insert_new_pkey(
-        self,
-        *,
-        namespace: str,
-        guid: str,
-        value: ValueDict,
-        labels: Labels,
-    ) -> str:
+    async def _insert_new_pkey(self, *, namespace: str, store_model: StoreModel) -> str:
         """Set the value and labels for a new primary key in the specified namespace."""
         pass
 
@@ -113,16 +135,62 @@ class Store(ABC):
         self,
         *,
         namespace: str,
-        guid: str,
         primary_key: str,
-        value: ValueDict,
-        labels: Labels,
+        store_model: StoreModel,
     ) -> str:
         """
         Insert a new primary key with the given value and labels.
         If the primary key already exists, throw a ConflictException.
         """
         pass
+
+    @abstractmethod
+    async def _put_instance_discovery(
+        self, *, key: str, primary_key: str, namespace: Optional[str], one_time: bool
+    ) -> None:
+        """
+        Store a public instance discovery key for a given primary key and namespace.
+        The discovery key is stored in the default namespace.
+
+        Args:
+            key: The public instance discovery key
+            primary_key: The primary key of the instance
+            namespace: Optional namespace of the instance (default is used if not provided)
+        """
+        pass
+
+    @abstractmethod
+    async def _get_instance_discovery(
+        self, *, key: str
+    ) -> Optional[tuple[str, Optional[str], bool]]:
+        """
+        Retrieve the primary key and namespace of an instance by a public discovery key.
+
+        Args:
+            key: The public instance discovery key
+
+        Returns:
+            The primary key of the instance, the namespace if available, and a flag indicating if the key is one-time
+        """
+        pass
+
+    @abstractmethod
+    async def _delete_instance_discovery(self, *, key: str) -> None:
+        """
+        Delete a public instance discovery key.
+
+        Args:
+            key: The public instance discovery key
+        """
+        pass
+
+    async def instance_discovery(self, *, key: str) -> tuple[str, Optional[str]]:
+        result = await self._get_instance_discovery(key=key)
+        if result is None:
+            raise NotFoundException("Instance discovery key not found")
+        if result[2]:
+            await self._delete_instance_discovery(key=key)
+        return result[0], result[1]
 
     def _get_namespace_name(self, namespace: Optional[str]) -> str:
         """Helper to get the actual namespace or default."""
@@ -186,6 +254,49 @@ class Store(ABC):
         else:
             return next(iter(primary_keys))
 
+    def _encrypt(self, value: ValueDict) -> bytes:
+        """
+        Dumps a dictionary to a string representation with special handling for the 'admin' key.
+        The 'admin' key's contents are hashed and replaced with {'hash': <hash_value>}.
+
+        It is then encrypted using the encryptor and returned as bytes.
+        Args:
+            input_dict (dict): The input dictionary which may contain 'user', 'admin',
+                            'callback', and/or 'state' keys
+
+        Returns:
+            bytes: JSON string representation of the modified dictionary
+        """
+        # Handle 'admin' key separately if it exists
+        # Convert admin content to a sorted, normalized JSON string for consistent hashing
+        admin_content = json.dumps(value["admin"], sort_keys=True)
+        admin_hash = sha256(admin_content.encode()).hexdigest()
+
+        result_dict: HashedValueDict = {
+            "user": value["user"],
+            "admin": {"hash": admin_hash},
+        }
+        if "callback" in value:
+            result_dict["callback"] = value["callback"]
+        if "state" in value:
+            result_dict["state"] = value["state"]
+
+        str_rep = json.dumps(result_dict, sort_keys=True)
+        return self.encryptor.encrypt(str_rep.encode())
+
+    def _decrypt(self, encrypted_value: bytes) -> HashedValueDict:
+        """
+        Decrypts an encrypted value and returns the decrypted dictionary.
+
+        Args:
+            encrypted_value (bytes): The encrypted value to decrypt
+
+        Returns:
+            dict: The decrypted dictionary
+        """
+        decrypted = self.encryptor.decrypt(encrypted_value)
+        return json.loads(decrypted.decode())
+
     async def put_by_primary_key(
         self,
         *,
@@ -208,27 +319,20 @@ class Store(ABC):
             ConflictException: If a value with the same primary key already exists
         """
         namespace = await self._ensure_namespace_exists(namespace)
-
+        encrypted_value = self._encrypt(value)
+        model = StoreModel(encrypted_value=encrypted_value, labels=labels, guid=guid)
         if await self._check_primary_keys(
             primary_keys=[primary_key], namespace=namespace
         ):
             return await self._update_existing_pkey(
-                namespace=namespace,
-                primary_key=primary_key,
-                value=value,
-                guid=guid,
-                labels=labels,
+                namespace=namespace, primary_key=primary_key, store_model=model
             )
         else:
             if throw_on_not_found:
                 raise NotFoundException("primary key did not exist")
             else:
                 return await self._insert_given_pkey(
-                    namespace=namespace,
-                    primary_key=primary_key,
-                    value=value,
-                    guid=guid,
-                    labels=labels,
+                    namespace=namespace, primary_key=primary_key, store_model=model
                 )
 
     async def put_by_labels(
@@ -254,7 +358,8 @@ class Store(ABC):
             ConflictException: If a conflict is detected (e.g., labels match existing entry, or multiple entries match)
         """
         namespace = await self._ensure_namespace_exists(namespace)
-
+        encrypted_value = self._encrypt(value)
+        model = StoreModel(encrypted_value=encrypted_value, labels=labels, guid=guid)
         existing_key = self._ensure_single_or_no_match(
             await self._find_primary_keys_by_labels(
                 namespace=namespace, guid=guid, labels=labels
@@ -262,16 +367,10 @@ class Store(ABC):
         )
         if existing_key:
             return await self._update_existing_pkey(
-                namespace=namespace,
-                primary_key=existing_key,
-                value=value,
-                guid=guid,
-                labels=labels,
+                namespace=namespace, primary_key=existing_key, store_model=model
             )
         else:
-            return await self._insert_new_pkey(
-                namespace=namespace, value=value, guid=guid, labels=labels
-            )
+            return await self._insert_new_pkey(namespace=namespace, store_model=model)
 
     async def get_by_primary_key(
         self, *, primary_key: str, namespace: Optional[str] = None
@@ -291,12 +390,21 @@ class Store(ABC):
         """
         namespace = await self._get_namespace(namespace)
 
-        result = await self._get_values_of_primary_keys(
-            namespace=namespace, primary_keys=[primary_key]
-        )
+        model = (
+            await self._get_encrypted_values_of_primary_keys(
+                namespace=namespace, primary_keys=[primary_key]
+            )
+        )[primary_key]
+
+        result: ValueAndLabels = {
+            "value": self._decrypt(model["encrypted_value"]),
+            "labels": model["labels"],
+            "guid": model["guid"],
+        }
+
         return {
             "primary_key": primary_key,
-            **result[primary_key],
+            **result,
         }
 
     async def get_by_labels(
@@ -324,12 +432,21 @@ class Store(ABC):
             )
         )
 
-        result = await self._get_values_of_primary_keys(
-            namespace=namespace, primary_keys=[primary_key]
-        )
+        model = (
+            await self._get_encrypted_values_of_primary_keys(
+                namespace=namespace, primary_keys=[primary_key]
+            )
+        )[primary_key]
+
+        result: ValueAndLabels = {
+            "value": self._decrypt(model["encrypted_value"]),
+            "labels": model["labels"],
+            "guid": model["guid"],
+        }
+
         return {
             "primary_key": primary_key,
-            **result[primary_key],
+            **result,
         }
 
     async def search(
@@ -361,16 +478,24 @@ class Store(ABC):
         ):
             raise ConflictException("Something is messed up")
 
-        values = await self._get_values_of_primary_keys(
+        models = await self._get_encrypted_values_of_primary_keys(
             namespace=namespace, primary_keys=primary_keys
         )
+        results: Dict[str, ValueAndLabels] = {
+            pk: {
+                "value": self._decrypt(model["encrypted_value"]),
+                "labels": model["labels"],
+                "guid": model["guid"],
+            }
+            for pk, model in models.items()
+        }
 
         return [
             {
                 "primary_key": pk,
-                **values[pk],
+                **results[pk],
             }
-            for pk in primary_keys
+            for pk in results
         ]
 
     async def delete_by_primary_key(
@@ -394,43 +519,3 @@ class Store(ABC):
             return None
         else:
             await self._delete(primary_key=primary_key, namespace=namespace)
-
-    @abstractmethod
-    async def put_instance_discovery(
-        self, *, key: str, primary_key: str, namespace: Optional[str]
-    ) -> None:
-        """
-        Store a public instance discovery key for a given primary key and namespace.
-        The discovery key is stored in the default namespace.
-
-        Args:
-            key: The public instance discovery key
-            primary_key: The primary key of the instance
-            namespace: Optional namespace of the instance (default is used if not provided)
-        """
-        pass
-
-    @abstractmethod
-    async def instance_discovery(
-        self, *, key: str
-    ) -> Optional[tuple[str, Optional[str]]]:
-        """
-        Retrieve the primary key and namespace of an instance by a public discovery key.
-
-        Args:
-            key: The public instance discovery key
-
-        Returns:
-            The primary key of the instance, and the namespace if available
-        """
-        pass
-
-    @abstractmethod
-    async def delete_instance_discovery(self, *, key: str) -> None:
-        """
-        Delete a public instance discovery key.
-
-        Args:
-            key: The public instance discovery key
-        """
-        pass

@@ -1,5 +1,4 @@
-from .types import ConfigurationSupplier, Sensitivity
+from .types import Sensitivity
 
-DEFAULT_SUPPLIER: ConfigurationSupplier = "user"
 DEFAULT_SENSITIVE: Sensitivity = "none"
 DEFAULT_TRIGGER_CALLBACK: bool = False

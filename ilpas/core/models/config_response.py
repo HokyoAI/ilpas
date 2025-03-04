@@ -5,18 +5,18 @@ from pydantic import BaseModel
 from .types import JsonValue
 
 
-class BasePutResponse(BaseModel):
+class BaseConfigResponse(BaseModel):
     config: Dict[str, JsonValue]
 
 
-class RedirectRequired(BasePutResponse):
+class RedirectRequired(BaseConfigResponse):
     redirect_required: Literal[True] = True
     redirect_uri: str
 
 
-class RedirectNotRequired(BasePutResponse):
+class RedirectNotRequired(BaseConfigResponse):
     redirect_required: Literal[False] = False
     redirect_uri: None = None
 
 
-type PutResponse = RedirectRequired | RedirectNotRequired
+type ConfigResponse = RedirectRequired | RedirectNotRequired

@@ -8,7 +8,10 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.12"
 fastapi = "^0.115.8"
+hatchet-sdk = "^0.47.0"
 click = {version = "^8.1.8", optional = true}
+httpx = "^0.28.1"
+cryptography = "^44.0.2"
 
 [tool.poetry.extras]
 cli=["click"]

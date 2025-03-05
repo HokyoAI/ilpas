@@ -49,9 +49,9 @@ class Catalog:
         self._hub.register(HatchetListener(hatchet))
         for listener in additional_listeners:
             self._hub.register(listener)
-        self._integration_registry: Dict[str, Integration[AM, AM, AM, AM]] = {}
+        self._integration_registry: Dict[str, Integration[AM, AM, AM, AM, AM]] = {}
 
-    def add_integration(self, *, integration: Integration[AM, AM, AM, AM]):
+    def add_integration(self, *, integration: Integration[AM, AM, AM, AM, AM]):
         if self.finalized:
             raise RuntimeError("Catalog is finalized, cannot add more integrations")
         if integration.spec.guid in self._integration_registry:
@@ -342,6 +342,8 @@ class Catalog:
             )
             instance.callback_config = callback_config
 
+            # push setup event if needed
+
             return await integration.spec.callback.respond(
                 query_params=query_dict,
                 user_config=instance.user_config,
@@ -360,30 +362,41 @@ class Catalog:
                 raise HTTPException(
                     status_code=404, detail="This integration does not accept webhooks"
                 )
-            if not await integration.spec.webhook.verify(
-                request, integration.supplied_config
-            ):
-                raise HTTPException(status_code=403, detail="Invalid webhook")
+            rest_of_path: str = request.path_params.get("rest_of_path", "")
+            rest_of_path.strip("/")
+            path_params = rest_of_path.split("/")
             discovery_key = await integration.spec.webhook.identify(
-                request, integration.supplied_config
+                path_params=path_params, request=request
             )
-            # instance = None
-            # if discovery_key:
-            #     instance = await Instance.restore_by_discovery_key(
-            #         store=self._store,
-            #         integration=integration,
-            #         key_type="webhook",
-            #         key=discovery_key,
-            #     )
-            # do this in event handling to avoid loading instance and respond quicker
+            instance: Instance | None = None
+            if discovery_key is not None:
+                try:
+                    instance = await Instance.restore_by_discovery_key(
+                        store=self._store,
+                        integration=integration,
+                        key_type="webhook",
+                        key=discovery_key,
+                    )
+                except NotFoundException:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Instance not found for webhook, discovery key invalid",
+                    )
+            config = instance() if instance else integration.supplied_integration_config
+            is_valid = await integration.spec.webhook.verify(
+                path_params=path_params, request=request, config=config
+            )
+            if not is_valid:
+                raise HTTPException(status_code=403, detail="Invalid webhook")
             event = await integration.spec.webhook.router(
-                request, integration.supplied_config
+                path_params=path_params, request=request, config=config
             )
-            # still need to publish event for handling
-            if event.respond:
-                return await event.respond(request)
-            else:
-                return Response(status_code=200)  # quick and decisive OK response
+
+            # publish event
+
+            return await integration.spec.webhook.respond(
+                path_params=path_params, request=request, config=config, event=event
+            )
 
         return webhook_handler
 

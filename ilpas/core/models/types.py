@@ -43,3 +43,10 @@ class SearchResult(ValueAndLabels):
 type KeyTypes = Literal["callback", "webhook"]
 
 type AM = BaseModel
+
+
+class InstanceConfig[_U: AM, _A: AM, _C: AM, _S: AM](TypedDict):
+    admin: _A
+    user: _U
+    callback: Optional[_C]
+    state: Optional[_S]

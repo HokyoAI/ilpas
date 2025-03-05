@@ -10,6 +10,7 @@ from .models.errors import BadDataError, IlpasValueError
 from .models.types import (
     AM,
     ConfigurationSupplier,
+    InstanceConfig,
     JsonValue,
     KeyTypes,
     Sensitivity,
@@ -18,7 +19,7 @@ from .models.types import (
 from .store import Labels, Store
 
 
-class Instance[_U: AM, _A: AM, _C: AM, _S: AM]():
+class Instance[_I: AM, _U: AM, _A: AM, _C: AM, _S: AM]():
 
     @property
     def user_config(self) -> _U:
@@ -85,7 +86,7 @@ class Instance[_U: AM, _A: AM, _C: AM, _S: AM]():
     def __init__(
         self,
         *,
-        integration: Integration[_U, _A, _C, _S],
+        integration: Integration[_I, _U, _A, _C, _S],
         store: Store,
         supplied_user_config: Dict[str, JsonValue],
         labels: Labels,
@@ -101,6 +102,14 @@ class Instance[_U: AM, _A: AM, _C: AM, _S: AM]():
         self.callback_config = None
         self._state = None
         self.primary_key: Optional[str] = None
+
+    def __call__(self) -> InstanceConfig[_U, _A, _C, _S]:
+        return {
+            "user": self.user_config,
+            "admin": self.admin_config,
+            "callback": self.callback_config,
+            "state": self.state,
+        }
 
     @classmethod
     async def restore_by_primary_key(
